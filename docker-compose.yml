@@ -1,0 +1,13 @@
+services:
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: chromadb_research
+    ports:
+      - "8001:8000"  # HOST_PORT:CONTAINER_PORT
+    volumes:
+      # Maps local folder 'chroma_data' to the container's data directory
+      - ./chroma_data:/data
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+      - ANONYMIZED_TELEMETRY=FALSE
