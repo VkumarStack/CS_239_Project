@@ -6,11 +6,15 @@ python plot_continuous_results.py --csv continuous_random_results.csv --out cont
 
 python plot_continuous_results.py --csv continuous_random_adaptive_results.csv --out continuous_random_adaptive_results.png --latency-y-min 2 --latency-y-max 8 --window 200
 
-python /home/ubuntu/CS_239_Project/benchmark_chroma_pressure.py \
+# Works on Marco's machine, had to set up chroma data outside of mounted dir for true page eviction behavior
+
+python benchmark_chroma_cache_pressure.py \
   --path /home/ubuntu/chroma_data \
-  --mem-steps-bytes 10G,20G,40G \
-  --stress-mode cache \
+  --mem-steps 0,40,60,75,85,90 \
   --vm-workers 2 \
   --queries-per-step 200 \
-  --csv-out /home/ubuntu/results_cache.csv \
-  --timeline-out /home/ubuntu/results_cache_timeline.csv
+  --query-mode fixed \
+  --preload-cache \
+  --track-vmtouch \
+  --csv-out /home/ubuntu/results_eviction.csv \
+  --timeline-out /home/ubuntu/results_eviction_timeline.csv

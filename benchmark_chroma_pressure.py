@@ -122,36 +122,22 @@ def warm_cache_with_vmtouch(data_path: str) -> None:
         raise RuntimeError(f"vmtouch failed with exit code {result.returncode}")
 
 
-def start_stress_process(mode: str, mem_percent: int | None, mem_bytes: int | None, vm_workers: int, data_path: str | None = None):
-    if mode not in ("memory", "cache"):
-        raise ValueError("mode must be 'memory' or 'cache'")
-
-    if (not mem_percent or mem_percent <= 0) and (not mem_bytes or mem_bytes <= 0):
+def start_stress_process(mem_percent: int, vm_workers: int):
+    if mem_percent <= 0:
         return None
 
     if shutil.which("stress-ng") is None:
         raise RuntimeError("stress-ng not found. Install it before running pressure ramps")
 
-    if mode == "memory":
-        cmd = ["stress-ng", "--vm", str(vm_workers), "--vm-keep", "--metrics-brief"]
-
-        if mem_bytes and mem_bytes > 0:
-            # distribute bytes evenly across workers to make allocations homogeneous
-            per_worker = max(1, int(mem_bytes) // max(1, vm_workers))
-            cmd += ["--vm-bytes", f"{per_worker}B"]
-        else:
-            cmd += ["--vm-bytes", f"{int(mem_percent)}%"]
-
-    else:  # cache mode -> use stress-ng hdd worker to churn page cache via IO
-        # For cache churn we write/read files so we avoid large anonymous allocations
-        cmd = ["stress-ng", "--hdd", str(vm_workers), "--metrics-brief"]
-        if mem_bytes and mem_bytes > 0:
-            # distribute bytes evenly across workers
-            per_worker = max(1, int(mem_bytes) // max(1, vm_workers))
-            cmd += ["--hdd-bytes", f"{per_worker}B", "--hdd-ops", "1"]
-        else:
-            # interpret mem_percent as approximate working set to touch via HDD writes
-            cmd += ["--hdd-bytes", f"{int(mem_percent)}%", "--hdd-ops", "1"]
+    cmd = [
+        "stress-ng",
+        "--vm",
+        str(vm_workers),
+        "--vm-bytes",
+        f"{mem_percent}%",
+        "--vm-keep",
+        "--metrics-brief",
+    ]
 
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -178,36 +164,6 @@ def parse_steps(steps_raw: str) -> List[int]:
     return steps
 
 
-def parse_size(size_str: str) -> int:
-    s = size_str.strip().upper()
-    if not s:
-        raise ValueError("empty size")
-
-    multipliers = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
-
-    # trailing letter indicates multiplier
-    if s[-1].isdigit():
-        # pure number -> bytes
-        return int(s)
-
-    unit = s[-1]
-    if unit not in multipliers:
-        raise ValueError(f"unknown size unit: {unit} in {size_str}")
-
-    num = float(s[:-1])
-    return int(num * multipliers[unit])
-
-
-def parse_steps_bytes(steps_raw: str) -> List[int]:
-    vals = [s.strip() for s in steps_raw.split(",") if s.strip()]
-    if not vals:
-        raise ValueError("--mem-steps-bytes must have at least one value")
-    steps: List[int] = []
-    for v in vals:
-        steps.append(parse_size(v))
-    return steps
-
-
 def maybe_write_csv(csv_path: str | None, rows: List[dict]) -> None:
     if not csv_path:
         return
@@ -215,7 +171,6 @@ def maybe_write_csv(csv_path: str | None, rows: List[dict]) -> None:
     fieldnames = [
         "step_index",
         "mem_percent",
-        "mem_bytes",
         "queries",
         "query_mode",
         "top_k",
@@ -250,17 +205,6 @@ def main():
         default="0,20,40,60,80",
         help="Comma-separated memory pressure percentages for stress-ng vm-bytes",
     )
-    parser.add_argument(
-        "--mem-steps-bytes",
-        default=None,
-        help="Comma-separated memory steps as absolute sizes (e.g. 1G,2G). Overrides --mem-steps when provided",
-    )
-    parser.add_argument(
-        "--stress-mode",
-        choices=["memory", "cache"],
-        default="memory",
-        help="Type of stress to apply: 'memory' for anonymous allocations, 'cache' to churn file cache via HDD I/O",
-    )
     parser.add_argument("--vm-workers", type=int, default=1, help="stress-ng --vm worker count")
     parser.add_argument("--settle-seconds", type=float, default=4.0, help="Wait time after starting stress before measuring")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -276,11 +220,6 @@ def main():
     )
     parser.add_argument("--preload-cache", action="store_true", help="Warm cache with vmtouch before test")
     parser.add_argument("--csv-out", default=None, help="Optional path to write per-step CSV results")
-    parser.add_argument(
-        "--timeline-out",
-        default=None,
-        help="Optional path to write per-query timeline CSV (elapsed_sec, latency_ms, target_pressure_pct, actual_pressure_pct)",
-    )
 
     args = parser.parse_args()
 
@@ -291,56 +230,10 @@ def main():
     if args.ef_search < 1:
         raise ValueError("--ef-search must be >= 1")
 
-    # choose percent-based or byte-based steps
-    if args.mem_steps_bytes:
-        mem_steps = parse_steps_bytes(args.mem_steps_bytes)
-        mem_is_bytes = True
-    else:
-        mem_steps = parse_steps(args.mem_steps)
-        mem_is_bytes = False
+    mem_steps = parse_steps(args.mem_steps)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
-
-    # read total memory (KB) for conversions
-    def read_mem_total_kb() -> float | None:
-        try:
-            with open("/proc/meminfo") as fh:
-                for line in fh:
-                    if line.startswith("MemTotal:"):
-                        return float(line.split()[1])
-        except Exception:
-            return None
-
-    mem_total_kb = read_mem_total_kb()
-
-    def bytes_to_pct(b: int) -> float | None:
-        if mem_total_kb and b is not None:
-            return (b / 1024.0) / mem_total_kb * 100.0
-        return None
-
-    def sample_actual_pressure_pct(mode: str) -> float | None:
-        # cache mode: sample Cached / MemTotal
-        # memory mode: sample used memory percent (MemTotal - MemAvailable)
-        try:
-            info = {}
-            with open("/proc/meminfo") as fh:
-                for line in fh:
-                    parts = line.split()
-                    info[parts[0].rstrip(":")] = float(parts[1])
-            if mem_total_kb is None:
-                return None
-            if mode == "cache":
-                cached = info.get("Cached") or info.get("SReclaimable", 0.0)
-                return (cached / mem_total_kb) * 100.0
-            else:
-                memavail = info.get("MemAvailable")
-                if memavail is None:
-                    return None
-                used_kb = mem_total_kb - memavail
-                return (used_kb / mem_total_kb) * 100.0
-        except Exception:
-            return None
 
     print(f"Opening persisted ChromaDB at: {args.path}")
     client = chromadb.PersistentClient(path=args.path)
@@ -365,28 +258,17 @@ def main():
             presampled_query_sets.append(fetch_random_query_embeddings(collection, args.queries_per_step))
 
     print("\n=== Pressure Ramp Benchmark ===")
-    if mem_is_bytes:
-        pretty = ",".join([f"{v}B" for v in mem_steps])
-    else:
-        pretty = ",".join([str(v) for v in mem_steps])
-    print(f"mem steps: {pretty}")
+    print(f"mem steps: {mem_steps}")
     print(f"queries/step: {args.queries_per_step}")
     print(f"query mode: {args.query_mode}")
     print(f"top_k: {args.top_k}")
 
     rows: List[dict] = []
-    timeline_rows: List[dict] = []
 
-    bench_start = time.time()
-    for step_idx, raw_step in enumerate(mem_steps, start=1):
+    for step_idx, mem_percent in enumerate(mem_steps, start=1):
         stress_proc = None
         try:
-            if mem_is_bytes:
-                stress_proc = start_stress_process(args.stress_mode, None, raw_step, args.vm_workers, args.path)
-                target_pct = bytes_to_pct(raw_step) or None
-            else:
-                stress_proc = start_stress_process(args.stress_mode, raw_step, None, args.vm_workers, args.path)
-                target_pct = float(raw_step)
+            stress_proc = start_stress_process(mem_percent, args.vm_workers)
             if stress_proc is not None and args.settle_seconds > 0:
                 time.sleep(args.settle_seconds)
 
@@ -408,20 +290,6 @@ def main():
                 ef_search=args.ef_search,
             )
 
-            # For timeline: sample per-query pressures
-            for i, (embedding, latency) in enumerate(zip(query_embeddings, latencies_ms)):
-                ts = time.time()
-                elapsed = ts - bench_start
-                actual_pct = sample_actual_pressure_pct(args.stress_mode)
-                timeline_rows.append(
-                    {
-                        "elapsed_sec": round(elapsed, 6),
-                        "latency_ms": round(float(latency), 6),
-                        "target_pressure_pct": round(float(target_pct), 6) if target_pct is not None else None,
-                        "actual_pressure_pct": round(float(actual_pct), 6) if actual_pct is not None else None,
-                    }
-                )
-
             sorted_latencies = sorted(latencies_ms)
             avg_ms = statistics.mean(sorted_latencies)
             p50_ms = percentile(sorted_latencies, 50)
@@ -431,8 +299,7 @@ def main():
 
             row = {
                 "step_index": step_idx,
-                "mem_percent": raw_step if not mem_is_bytes else None,
-                "mem_bytes": raw_step if mem_is_bytes else None,
+                "mem_percent": mem_percent,
                 "queries": len(sorted_latencies),
                 "query_mode": args.query_mode,
                 "top_k": args.top_k,
@@ -445,31 +312,15 @@ def main():
                 "max_ms": round(max_ms, 3),
             }
             rows.append(row)
-            if mem_is_bytes:
-                mem_display = f"{raw_step}B"
-            else:
-                mem_display = f"{raw_step}%"
 
             print(
-                f"step {step_idx}/{len(mem_steps)} | mem={mem_display} "
+                f"step {step_idx}/{len(mem_steps)} | mem={mem_percent:>2}% "
                 f"| avg={avg_ms:.3f} ms | p50={p50_ms:.3f} ms | p99={p99_ms:.3f} ms"
             )
         finally:
             stop_stress_process(stress_proc)
 
     maybe_write_csv(args.csv_out, rows)
-    # write per-query timeline if requested
-    if args.timeline_out:
-        outp = Path(args.timeline_out)
-        outp.parent.mkdir(parents=True, exist_ok=True)
-        with outp.open("w", newline="") as fh:
-            writer = csv.DictWriter(
-                fh, fieldnames=["elapsed_sec", "latency_ms", "target_pressure_pct", "actual_pressure_pct"]
-            )
-            writer.writeheader()
-            for r in timeline_rows:
-                # ensure None -> empty string
-                writer.writerow({k: ("" if v is None else v) for k, v in r.items()})
 
     if args.csv_out:
         print(f"\nWrote CSV: {args.csv_out}")
