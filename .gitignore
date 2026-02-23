@@ -1,1 +1,2 @@
-/chroma_data
+chroma_data/
+__pycache__/
