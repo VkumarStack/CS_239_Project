@@ -5,3 +5,11 @@ python benchmark_chroma_continuous.py --path chroma_data --collection noise_test
 python plot_continuous_results.py --csv continuous_random_results.csv --out continuous_random_results.png --latency-y-min 2 --latency-y-max 8 --window 200
 
 python plot_continuous_results.py --csv continuous_random_adaptive_results.csv --out continuous_random_adaptive_results.png --latency-y-min 2 --latency-y-max 8 --window 200
+
+python benchmark_chroma_pressure.py \
+  --path /data/chroma \
+  --mem-steps-bytes 10G,20G,40G \
+  --stress-mode cache \
+  --vm-workers 2 \
+  --queries-per-step 200 \
+  --csv-out results_cache.csv
