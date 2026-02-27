@@ -1,0 +1,14 @@
+# Project 
+- Find some related works on optimizing vector bases against noisy external processes (Adam)
+- Do background research on how vector databases work (how they actually fetch entries and what part of this might be heavily dependent on memory availability and cache availability) (Adam)
+- Measure cache contention versus latency (Marco)
+    - Note if this works
+- Adjust memory measurement versus latency (Vivek)
+    - Note if this works
+- Explore some optimizations
+    - ef_search adaptive (Vivek)
+    - quantization of vectors (Vivek)
+    - two types of collections: (1) compressed storage versus (2) uncompressed storage
+        - Switch to fetching from compressed (low dimensionality / quantized) vector db when there is memory pressure (maybe future work?)
+- Test everything once polished on bare-metal Linux server
+    - Improvements on latency when there is cache and/or memory pressure
