@@ -1,4 +1,0 @@
-step_index,mem_percent,mem_bytes,queries,query_mode,top_k,ef_search,cache_preloaded,avg_ms,p50_ms,p99_ms,min_ms,max_ms
-1,,10737418240,200,resample,10,100,False,2.961,2.922,3.91,2.635,4.116
-2,,21474836480,200,resample,10,100,False,3.069,3.026,3.627,2.772,4.044
-3,,42949672960,200,resample,10,100,False,3.308,3.261,3.964,2.925,4.972

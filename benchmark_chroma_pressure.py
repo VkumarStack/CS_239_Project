@@ -276,6 +276,11 @@ def main():
     )
     parser.add_argument("--preload-cache", action="store_true", help="Warm cache with vmtouch before test")
     parser.add_argument("--csv-out", default=None, help="Optional path to write per-step CSV results")
+    parser.add_argument(
+        "--timeline-out",
+        default=None,
+        help="Optional path to write per-query timeline CSV (elapsed_sec, latency_ms, target_pressure_pct, actual_pressure_pct)",
+    )
 
     args = parser.parse_args()
 
@@ -296,6 +301,46 @@ def main():
 
     random.seed(args.seed)
     np.random.seed(args.seed)
+
+    # read total memory (KB) for conversions
+    def read_mem_total_kb() -> float | None:
+        try:
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    if line.startswith("MemTotal:"):
+                        return float(line.split()[1])
+        except Exception:
+            return None
+
+    mem_total_kb = read_mem_total_kb()
+
+    def bytes_to_pct(b: int) -> float | None:
+        if mem_total_kb and b is not None:
+            return (b / 1024.0) / mem_total_kb * 100.0
+        return None
+
+    def sample_actual_pressure_pct(mode: str) -> float | None:
+        # cache mode: sample Cached / MemTotal
+        # memory mode: sample used memory percent (MemTotal - MemAvailable)
+        try:
+            info = {}
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    parts = line.split()
+                    info[parts[0].rstrip(":")] = float(parts[1])
+            if mem_total_kb is None:
+                return None
+            if mode == "cache":
+                cached = info.get("Cached") or info.get("SReclaimable", 0.0)
+                return (cached / mem_total_kb) * 100.0
+            else:
+                memavail = info.get("MemAvailable")
+                if memavail is None:
+                    return None
+                used_kb = mem_total_kb - memavail
+                return (used_kb / mem_total_kb) * 100.0
+        except Exception:
+            return None
 
     print(f"Opening persisted ChromaDB at: {args.path}")
     client = chromadb.PersistentClient(path=args.path)
@@ -330,14 +375,18 @@ def main():
     print(f"top_k: {args.top_k}")
 
     rows: List[dict] = []
+    timeline_rows: List[dict] = []
 
+    bench_start = time.time()
     for step_idx, raw_step in enumerate(mem_steps, start=1):
         stress_proc = None
         try:
             if mem_is_bytes:
                 stress_proc = start_stress_process(args.stress_mode, None, raw_step, args.vm_workers, args.path)
+                target_pct = bytes_to_pct(raw_step) or None
             else:
                 stress_proc = start_stress_process(args.stress_mode, raw_step, None, args.vm_workers, args.path)
+                target_pct = float(raw_step)
             if stress_proc is not None and args.settle_seconds > 0:
                 time.sleep(args.settle_seconds)
 
@@ -358,6 +407,20 @@ def main():
                 ef_mode=ef_mode,
                 ef_search=args.ef_search,
             )
+
+            # For timeline: sample per-query pressures
+            for i, (embedding, latency) in enumerate(zip(query_embeddings, latencies_ms)):
+                ts = time.time()
+                elapsed = ts - bench_start
+                actual_pct = sample_actual_pressure_pct(args.stress_mode)
+                timeline_rows.append(
+                    {
+                        "elapsed_sec": round(elapsed, 6),
+                        "latency_ms": round(float(latency), 6),
+                        "target_pressure_pct": round(float(target_pct), 6) if target_pct is not None else None,
+                        "actual_pressure_pct": round(float(actual_pct), 6) if actual_pct is not None else None,
+                    }
+                )
 
             sorted_latencies = sorted(latencies_ms)
             avg_ms = statistics.mean(sorted_latencies)
@@ -395,6 +458,18 @@ def main():
             stop_stress_process(stress_proc)
 
     maybe_write_csv(args.csv_out, rows)
+    # write per-query timeline if requested
+    if args.timeline_out:
+        outp = Path(args.timeline_out)
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        with outp.open("w", newline="") as fh:
+            writer = csv.DictWriter(
+                fh, fieldnames=["elapsed_sec", "latency_ms", "target_pressure_pct", "actual_pressure_pct"]
+            )
+            writer.writeheader()
+            for r in timeline_rows:
+                # ensure None -> empty string
+                writer.writerow({k: ("" if v is None else v) for k, v in r.items()})
 
     if args.csv_out:
         print(f"\nWrote CSV: {args.csv_out}")
