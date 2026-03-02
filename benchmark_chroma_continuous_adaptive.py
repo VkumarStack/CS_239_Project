@@ -31,6 +31,27 @@ def percentile(sorted_values: List[float], pct: float) -> float:
 
 
 def get_mem_total_bytes() -> int:
+    """Get total memory available, respecting cgroup limits if present."""
+    # Try cgroups v2 first
+    try:
+        with open("/sys/fs/cgroup/memory.max", "r", encoding="utf-8") as f:
+            value = f.read().strip()
+            if value != "max":
+                return int(value)
+    except (FileNotFoundError, PermissionError, ValueError):
+        pass
+    
+    # Try cgroups v1
+    try:
+        with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r", encoding="utf-8") as f:
+            value = int(f.read().strip())
+            # cgroups v1 uses a very large number to indicate "no limit"
+            if value < (1 << 62):
+                return value
+    except (FileNotFoundError, PermissionError, ValueError):
+        pass
+    
+    # Fallback to system memory
     with open("/proc/meminfo", "r", encoding="utf-8") as f:
         for line in f:
             if line.startswith("MemTotal:"):
