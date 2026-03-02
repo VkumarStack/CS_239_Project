@@ -111,17 +111,6 @@ def infer_embedding_dim(collection) -> int:
         raise RuntimeError("Could not infer embedding dimension from collection")
     return len(embeddings[0])
 
-
-def warm_cache_with_vmtouch(data_path: str) -> None:
-    if shutil.which("vmtouch") is None:
-        raise RuntimeError("vmtouch not found. Install it or run without --preload-cache")
-
-    cmd = ["vmtouch", "-t", "-f", "-q", data_path]
-    result = subprocess.run(cmd, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"vmtouch failed with exit code {result.returncode}")
-
-
 def apply_ef_search(collection, ef_search: int) -> str:
     current_config = collection.configuration or {}
     current_hnsw_cfg = dict(current_config.get("hnsw") or {})
@@ -222,7 +211,6 @@ def main():
     parser.add_argument("--chunk-mb", type=int, default=64, help="Allocator chunk size in MB")
     parser.add_argument("--allocator-pause-ms", type=float, default=25.0, help="Pause between allocation checks")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--preload-cache", action="store_true", help="Warm data path in page cache via vmtouch")
     parser.add_argument("--csv-out", default="continuous_results.csv", help="CSV file for per-query latency timeline")
 
     args = parser.parse_args()
@@ -260,12 +248,10 @@ def main():
     print(f"Opening persisted ChromaDB at: {args.path}")
     client = chromadb.PersistentClient(path=args.path)
     collection = load_collection(client, args.collection)
+    total_vectors = collection.count()
+    print(f"  Collection has {total_vectors:,} vectors")
     print(f"Using collection: {collection.name}")
     print(f"Collection vector count: {collection.count()}")
-
-    if args.preload_cache:
-        print("Warming file cache via vmtouch...")
-        warm_cache_with_vmtouch(args.path)
 
     ef_mode = apply_ef_search(collection, args.ef_search)
     print(f"ef_search mode: {ef_mode}")
