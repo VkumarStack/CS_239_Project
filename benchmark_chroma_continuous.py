@@ -33,7 +33,7 @@ def get_mem_total_bytes() -> int:
     """Get total memory available, respecting cgroup limits if present."""
     # Try cgroups v2 first
     try:
-        with open("/sys/fs/cgroup/memory.max", "r", encoding="utf-8") as f:
+        with open("/sys/fs/cgroup/chromabench/memory.max", "r", encoding="utf-8") as f:
             value = f.read().strip()
             if value != "max":
                 return int(value)
