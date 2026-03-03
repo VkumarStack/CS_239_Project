@@ -6,6 +6,7 @@ import random
 import shutil
 import statistics
 import subprocess
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -66,9 +67,14 @@ def memory_pressure_worker(
     stop_event: object,
     chunk_bytes: int,
     pause_seconds: float,
+    read_segment_bytes: int = 0,
+    read_interval_seconds: float = 0.1,
 ) -> None:
     chunks: List[bytearray] = []
     allocated = 0
+    read_chunk_idx = 0
+    read_chunk_offset = 0
+    last_read_time = time.monotonic()
 
     while not stop_event.is_set():
         with target_bytes.get_lock():
@@ -79,10 +85,36 @@ def memory_pressure_worker(
             size = chunk_bytes if remaining > chunk_bytes else remaining
             if size <= 0:
                 break
-            chunks.append(bytearray(size))
+            chunk = bytearray(size)
+            # Touch every OS page to force physical mapping and dirty the pages,
+            # preventing the kernel from using zero-page sharing or demand-paging.
+            for i in range(0, size, 4096):
+                chunk[i] = 0xAB
+            chunks.append(chunk)
             allocated += size
             with actual_bytes.get_lock():
                 actual_bytes.value = allocated
+
+        # Rolling read-through: scan a fixed-size segment of allocated memory every
+        # read_interval_seconds, picking up where the previous sweep left off.  This
+        # keeps pages active and creates genuine memory competition with the query workload.
+        now = time.monotonic()
+        if read_segment_bytes > 0 and chunks and (now - last_read_time) >= read_interval_seconds:
+            last_read_time = now
+            bytes_remaining = read_segment_bytes
+            while bytes_remaining > 0:
+                if read_chunk_idx >= len(chunks):
+                    read_chunk_idx = 0
+                    read_chunk_offset = 0
+                current_chunk = chunks[read_chunk_idx]
+                available = len(current_chunk) - read_chunk_offset
+                to_read = min(bytes_remaining, available)
+                _ = current_chunk[read_chunk_offset : read_chunk_offset + to_read]
+                read_chunk_offset += to_read
+                bytes_remaining -= to_read
+                if read_chunk_offset >= len(current_chunk):
+                    read_chunk_idx = (read_chunk_idx + 1) % len(chunks)
+                    read_chunk_offset = 0
 
         time.sleep(pause_seconds)
 
@@ -276,12 +308,25 @@ def main():
     parser.add_argument("--ramp-seconds", type=float, default=120.0, help="Seconds to linearly ramp pressure")
     parser.add_argument("--chunk-mb", type=int, default=64, help="Allocator chunk size in MB")
     parser.add_argument("--allocator-pause-ms", type=float, default=25.0, help="Pause between allocation checks")
+    parser.add_argument(
+        "--read-segment-mb",
+        type=int,
+        default=64,
+        help="MB of allocated memory to read per read cycle (0 to disable read-through)",
+    )
+    parser.add_argument(
+        "--read-interval-ms",
+        type=float,
+        default=100.0,
+        help="Minimum time between rolling read sweeps in milliseconds",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--csv-out",
-        default="continuous_adaptive_results.csv",
+        default="outputs/continuous_adaptive_results.csv",
         help="CSV file for per-query latency timeline",
     )
+    parser.add_argument("--plot-window", type=int, default=200, help="Rolling window size for the auto-generated plot")
 
     args = parser.parse_args()
 
@@ -335,6 +380,10 @@ def main():
         raise ValueError("--ramp-seconds must be > 0")
     if args.chunk_mb < 1:
         raise ValueError("--chunk-mb must be >= 1")
+    if args.read_segment_mb < 0:
+        raise ValueError("--read-segment-mb must be >= 0")
+    if args.read_interval_ms <= 0:
+        raise ValueError("--read-interval-ms must be > 0")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -377,10 +426,20 @@ def main():
 
     chunk_bytes = args.chunk_mb * 1024 * 1024
     pause_seconds = args.allocator_pause_ms / 1000.0
+    read_segment_bytes = args.read_segment_mb * 1024 * 1024
+    read_interval_seconds = args.read_interval_ms / 1000.0
 
     pressure_proc = mp.Process(
         target=memory_pressure_worker,
-        args=(target_bytes, actual_bytes, stop_event, chunk_bytes, pause_seconds),
+        args=(
+            target_bytes,
+            actual_bytes,
+            stop_event,
+            chunk_bytes,
+            pause_seconds,
+            read_segment_bytes,
+            read_interval_seconds,
+        ),
         daemon=True,
     )
 
@@ -558,6 +617,21 @@ def main():
     maybe_write_csv(args.csv_out, rows)
     if args.csv_out:
         print(f"Wrote CSV timeline: {args.csv_out}")
+        csv_path = Path(args.csv_out)
+        png_path = csv_path.with_suffix(".png")
+        plot_script = Path(__file__).parent / "plot_continuous_results.py"
+        try:
+            subprocess.run(
+                [
+                    sys.executable, str(plot_script),
+                    "--csv", str(csv_path),
+                    "--out", str(png_path),
+                    "--window", str(args.plot_window),
+                ],
+                check=True,
+            )
+        except Exception as exc:
+            print(f"Warning: plot generation failed: {exc}")
 
 
 if __name__ == "__main__":
