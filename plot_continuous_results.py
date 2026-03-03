@@ -84,10 +84,17 @@ def make_plot(
     roll_p99 = rolling_percentile(latency, window, 99)
 
     # Auto-compute latency y-axis limits from the data when not explicitly provided.
-    # Bottom: the minimum observed latency; Top: at most 20x the minimum latency.
+    # Bottom: the minimum observed latency.
+    # Top: max(peak rolling-P99, 20 × floor rolling-P99) — shows the worst spike
+    #      while keeping the scale sane when spikes are modest.
     min_latency = float(np.min(latency))
     y_min = latency_y_min if latency_y_min is not None else min_latency
-    y_max = latency_y_max if latency_y_max is not None else min_latency * 20.0
+    if latency_y_max is not None:
+        y_max = latency_y_max
+    else:
+        max_p99 = float(np.nanmax(roll_p99))
+        min_p99 = float(np.nanmin(roll_p99))
+        y_max = max(max_p99, min_p99 * 10.0)
 
     has_ef = ef_search is not None
     n_rows = 3 if has_ef else 2
