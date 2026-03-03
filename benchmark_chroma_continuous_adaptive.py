@@ -95,6 +95,19 @@ def memory_pressure_worker(
             with actual_bytes.get_lock():
                 actual_bytes.value = allocated
 
+        while allocated > desired and chunks:
+            removed = chunks.pop()
+            allocated -= len(removed)
+            # Keep the rolling-read cursor in bounds after shrinking.
+            if chunks:
+                read_chunk_idx = read_chunk_idx % len(chunks)
+                read_chunk_offset = min(read_chunk_offset, len(chunks[read_chunk_idx]) - 1)
+            else:
+                read_chunk_idx = 0
+                read_chunk_offset = 0
+        with actual_bytes.get_lock():
+            actual_bytes.value = allocated
+
         # Rolling read-through: scan a percentage of currently allocated memory every
         # read_interval_seconds, picking up where the previous sweep left off.  This
         # keeps pages active and creates genuine memory competition with the query workload.
