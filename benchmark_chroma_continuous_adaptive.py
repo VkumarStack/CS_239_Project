@@ -234,6 +234,48 @@ def maybe_write_csv(path: str | None, rows: List[dict]) -> None:
         writer.writerows(rows)
 
 
+# ---------------------------------------------------------------------------
+# Pressure profiles — each factory returns a callable: (elapsed_sec: float) -> target_pct: float
+# ---------------------------------------------------------------------------
+
+def make_ramp_profile(start_pct: float, end_pct: float, ramp_seconds: float):
+    """Linear ramp from start_pct to end_pct over ramp_seconds, then holds at end_pct."""
+    def _profile(elapsed: float) -> float:
+        progress = min(elapsed / ramp_seconds, 1.0)
+        return start_pct + (end_pct - start_pct) * progress
+    return _profile
+
+
+def make_spike_profile(
+    baseline_pct: float,
+    peak_pct: float,
+    rise_seconds: float,
+    hold_seconds: float,
+    fall_seconds: float,
+    idle_seconds: float,
+):
+    """
+    Periodic spike: rises linearly from baseline_pct to peak_pct over rise_seconds,
+    holds at peak_pct for hold_seconds, falls linearly back to baseline_pct over
+    fall_seconds, idles at baseline_pct for idle_seconds, then repeats.
+    """
+    period = rise_seconds + hold_seconds + fall_seconds + idle_seconds
+
+    def _profile(elapsed: float) -> float:
+        phase = elapsed % period
+        if phase < rise_seconds:
+            return baseline_pct + (peak_pct - baseline_pct) * (phase / rise_seconds)
+        phase -= rise_seconds
+        if phase < hold_seconds:
+            return peak_pct
+        phase -= hold_seconds
+        if phase < fall_seconds:
+            return peak_pct + (baseline_pct - peak_pct) * (phase / fall_seconds)
+        return baseline_pct
+
+    return _profile
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Continuously ramp memory pressure with one process while continuously querying Chroma with adaptive ef_search"
@@ -312,6 +354,19 @@ def main():
     parser.add_argument("--pressure-start-pct", type=float, default=0.0, help="Starting pressure percent of total RAM")
     parser.add_argument("--pressure-end-pct", type=float, default=80.0, help="Ending pressure percent of total RAM")
     parser.add_argument("--ramp-seconds", type=float, default=120.0, help="Seconds to linearly ramp pressure")
+    parser.add_argument(
+        "--pressure-profile",
+        choices=["ramp", "spike"],
+        default="ramp",
+        help="Pressure shape: 'ramp' (linear, default) or 'spike' (periodic allocation pulses)",
+    )
+    # Spike-profile parameters (ignored when --pressure-profile=ramp)
+    parser.add_argument("--spike-baseline-pct", type=float, default=0.0, help="Memory pressure %% held between spikes")
+    parser.add_argument("--spike-peak-pct", type=float, default=70.0, help="Peak memory pressure %% reached during each spike")
+    parser.add_argument("--spike-rise-seconds", type=float, default=5.0, help="Seconds to ramp from baseline to peak")
+    parser.add_argument("--spike-hold-seconds", type=float, default=10.0, help="Seconds to hold at peak pressure")
+    parser.add_argument("--spike-fall-seconds", type=float, default=5.0, help="Seconds to fall from peak back to baseline")
+    parser.add_argument("--spike-idle-seconds", type=float, default=20.0, help="Seconds to idle at baseline before repeating")
     parser.add_argument("--chunk-mb", type=int, default=64, help="Allocator chunk size in MB")
     parser.add_argument("--allocator-pause-ms", type=float, default=25.0, help="Pause between allocation checks")
     parser.add_argument(
@@ -392,9 +447,33 @@ def main():
         raise ValueError("--read-segment-pct must be in [0, 100]")
     if args.read_interval_ms <= 0:
         raise ValueError("--read-interval-ms must be > 0")
+    if args.pressure_profile == "spike":
+        if args.spike_baseline_pct < 0 or args.spike_baseline_pct > 95:
+            raise ValueError("--spike-baseline-pct must be in [0, 95]")
+        if args.spike_peak_pct <= args.spike_baseline_pct or args.spike_peak_pct > 95:
+            raise ValueError("--spike-peak-pct must be > --spike-baseline-pct and <= 95")
+        if args.spike_rise_seconds <= 0:
+            raise ValueError("--spike-rise-seconds must be > 0")
+        if args.spike_hold_seconds <= 0:
+            raise ValueError("--spike-hold-seconds must be > 0")
+        if args.spike_fall_seconds <= 0:
+            raise ValueError("--spike-fall-seconds must be > 0")
+        if args.spike_idle_seconds < 0:
+            raise ValueError("--spike-idle-seconds must be >= 0")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
+
+    if args.pressure_profile == "ramp":
+        profile_fn = make_ramp_profile(
+            args.pressure_start_pct, args.pressure_end_pct, args.ramp_seconds
+        )
+    else:
+        profile_fn = make_spike_profile(
+            args.spike_baseline_pct, args.spike_peak_pct,
+            args.spike_rise_seconds, args.spike_hold_seconds,
+            args.spike_fall_seconds, args.spike_idle_seconds,
+        )
 
     print(f"Opening persisted ChromaDB at: {args.path}")
     client = chromadb.PersistentClient(path=args.path)
@@ -476,8 +555,7 @@ def main():
             if elapsed >= args.duration_seconds:
                 break
 
-            ramp_progress = min(elapsed / args.ramp_seconds, 1.0)
-            target_pct = args.pressure_start_pct + (args.pressure_end_pct - args.pressure_start_pct) * ramp_progress
+            target_pct = profile_fn(elapsed)
             target_b = int((target_pct / 100.0) * mem_total_bytes)
             with target_bytes.get_lock():
                 target_bytes.value = target_b
