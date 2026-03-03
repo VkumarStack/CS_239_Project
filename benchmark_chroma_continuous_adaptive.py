@@ -253,6 +253,12 @@ def main():
         help="Number of consecutive latency spikes required before lowering ef_search",
     )
     parser.add_argument(
+        "--consecutive-calm-to-increase",
+        type=int,
+        default=3,
+        help="Number of consecutive non-spike queries required before raising ef_search",
+    )
+    parser.add_argument(
         "--spike-threshold-ms",
         type=float,
         default=100.0,
@@ -350,6 +356,8 @@ def main():
         raise ValueError("--ef-step-up must be >= 1")
     if args.consecutive_spikes_to_reduce < 1:
         raise ValueError("--consecutive-spikes-to-reduce must be >= 1")
+    if args.consecutive_calm_to_increase < 1:
+        raise ValueError("--consecutive-calm-to-increase must be >= 1")
     if args.spike_threshold_ms <= 0:
         raise ValueError("--spike-threshold-ms must be > 0")
     if args.spike_window_size < 2:
@@ -529,7 +537,7 @@ def main():
                 and current_ef < args.ef_max
                 and recent_window_p99 is not None
                 and recent_window_p99 < args.spike_threshold_ms
-                and consecutive_calm >= args.controller_cooldown_queries
+                and consecutive_calm >= args.consecutive_calm_to_increase
                 and (query_index - last_adjustment_query) >= args.controller_cooldown_queries
             ):
                 next_ef = min(args.ef_max, current_ef + args.ef_step_up)
