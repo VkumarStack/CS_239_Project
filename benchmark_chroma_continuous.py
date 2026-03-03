@@ -66,7 +66,7 @@ def memory_pressure_worker(
     stop_event: object,
     chunk_bytes: int,
     pause_seconds: float,
-    read_segment_bytes: int = 0,
+    read_segment_pct: float = 0.0,
     read_interval_seconds: float = 0.1,
 ) -> None:
     chunks: List[bytearray] = []
@@ -94,13 +94,13 @@ def memory_pressure_worker(
             with actual_bytes.get_lock():
                 actual_bytes.value = allocated
 
-        # Rolling read-through: scan a fixed-size segment of allocated memory every
+        # Rolling read-through: scan a percentage of currently allocated memory every
         # read_interval_seconds, picking up where the previous sweep left off.  This
         # keeps pages active and creates genuine memory competition with the query workload.
         now = time.monotonic()
-        if read_segment_bytes > 0 and chunks and (now - last_read_time) >= read_interval_seconds:
+        if read_segment_pct > 0 and allocated > 0 and chunks and (now - last_read_time) >= read_interval_seconds:
             last_read_time = now
-            bytes_remaining = read_segment_bytes
+            bytes_remaining = max(1, int(allocated * read_segment_pct / 100.0))
             while bytes_remaining > 0:
                 if read_chunk_idx >= len(chunks):
                     read_chunk_idx = 0
@@ -264,10 +264,10 @@ def main():
     parser.add_argument("--chunk-mb", type=int, default=64, help="Allocator chunk size in MB")
     parser.add_argument("--allocator-pause-ms", type=float, default=25.0, help="Pause between allocation checks")
     parser.add_argument(
-        "--read-segment-mb",
-        type=int,
-        default=64,
-        help="MB of allocated memory to read per read cycle (0 to disable read-through)",
+        "--read-segment-pct",
+        type=float,
+        default=0.0,
+        help="Percentage of currently allocated memory to read per sweep cycle (0 to disable read-through)",
     )
     parser.add_argument(
         "--read-interval-ms",
@@ -307,8 +307,8 @@ def main():
         raise ValueError("--ramp-seconds must be > 0")
     if args.chunk_mb < 1:
         raise ValueError("--chunk-mb must be >= 1")
-    if args.read_segment_mb < 0:
-        raise ValueError("--read-segment-mb must be >= 0")
+    if args.read_segment_pct < 0 or args.read_segment_pct > 100:
+        raise ValueError("--read-segment-pct must be in [0, 100]")
     if args.read_interval_ms <= 0:
         raise ValueError("--read-interval-ms must be > 0")
 
@@ -347,7 +347,7 @@ def main():
 
     chunk_bytes = args.chunk_mb * 1024 * 1024
     pause_seconds = args.allocator_pause_ms / 1000.0
-    read_segment_bytes = args.read_segment_mb * 1024 * 1024
+    read_segment_pct = args.read_segment_pct
     read_interval_seconds = args.read_interval_ms / 1000.0
 
     pressure_proc = mp.Process(
@@ -358,7 +358,7 @@ def main():
             stop_event,
             chunk_bytes,
             pause_seconds,
-            read_segment_bytes,
+            read_segment_pct,
             read_interval_seconds,
         ),
         daemon=True,
