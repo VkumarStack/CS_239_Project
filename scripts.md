@@ -27,3 +27,18 @@ python benchmark_chroma_cache_pressure.py \
   --track-vmtouch \
   --csv-out /home/ubuntu/results_eviction.csv \
   --timeline-out /home/ubuntu/results_eviction_timeline.csv
+
+## Continuous adaptive cache-pressure benchmark
+python benchmark_chroma_cache_continuous_adaptive.py \
+  --path /home/ubuntu/chroma_data \
+  --duration-seconds 150 \
+  --query-pool-size 500 \
+  --vm-workers 2 \
+  --initial-pressure-pct 40 \
+  --min-pressure-pct 0 \
+  --max-pressure-pct 80 \
+  --pressure-step-pct 5 \
+  --eval-window-queries 200 \
+  --spike-threshold-ms 150 \
+  --calm-threshold-ms 50 \
+  --csv-out /home/ubuntu/CS_239_Project/continuous_cache_adaptive_2.csv
