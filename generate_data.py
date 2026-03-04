@@ -3,7 +3,7 @@ import chromadb
 import time
 
 # --- CONFIGURATION ---
-NUM_VECTORS = 812500   # Adjust this to hit your 5GB target
+NUM_VECTORS = 35_791_394  # ~128GB target (128 * 1024^3 / (960 * 4 bytes))
 DIMENSIONS = 960          # Matches GIST-1M dataset size
 BATCH_SIZE = 10_000       # Efficient batch size for ingestion
 DATA_PATH = "chroma_data" # Local directory for ChromaDB data
@@ -28,12 +28,16 @@ def main():
         metadata={"hnsw:space": "cosine"}
     )
     
+    # Resume from existing data
+    already_inserted = collection.count()
+    print(f"Already inserted: {already_inserted} vectors ({already_inserted * DIMENSIONS * 4 / 1024**3:.2f} GB)")
     print(f"Target Memory Size: {NUM_VECTORS * DIMENSIONS * 4 / 1024**3:.2f} GB (Raw Data Only)")
+    print(f"Remaining: {(NUM_VECTORS - already_inserted) * DIMENSIONS * 4 / 1024**3:.2f} GB")
     print("Starting data generation and insertion...")
     
     start_total = time.time()
     
-    for i in range(0, NUM_VECTORS, actual_batch_size):
+    for i in range(already_inserted, NUM_VECTORS, actual_batch_size):
         # Calculate remaining vectors to avoid exceeding NUM_VECTORS
         remaining = NUM_VECTORS - i
         current_batch = min(actual_batch_size, remaining)
