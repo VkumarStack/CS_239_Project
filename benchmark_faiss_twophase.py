@@ -1,0 +1,778 @@
+"""benchmark_faiss_twophase.py
+
+Two-pass FAISS benchmark for evaluating the memory-pressure trade-off between
+search quality and latency.
+
+Architecture
+------------
+  Pass 1  (always):   INT8 HNSW coarse search → candidate set of size (top_k * candidate_mult)
+  Pass 2  (adaptive): Fetch the corresponding float32 vectors and re-rank by exact L2 distance.
+                      Skipped when actual memory pressure >= --rerank-threshold-pct.
+
+Memory budget
+-------------
+Both indexes are sized to fit within --total-index-gb.  The same flag works on a
+laptop (e.g., 0.5) and a bare-metal server (e.g., 64).  A memory breakdown is
+printed at startup so you can verify the budget before a long run.
+
+  float32 store   : N × dim × 4 bytes
+  int8 SQ vectors : N × dim × 1 byte
+  HNSW graph      : N × 2 × M × 4 bytes  (per-node neighbor lists, approximate)
+  ─────────────────────────────────────────
+  total           ≈ N × (5×dim + 8×M) bytes
+
+Output CSV is compatible with plot_continuous_results.py (required columns:
+elapsed_sec, latency_ms, target_pressure_pct, actual_pressure_pct).
+
+Usage examples
+--------------
+# 8 GB WSL machine — 0.5 GB index, ramp pressure (index cached after first run)
+python benchmark_faiss_twophase.py --total-index-gb 0.5 --dim 128 \\
+    --pressure-end-pct 75 --duration-seconds 120
+
+# 128 GB bare-metal — 48 GB index, spike pressure profile
+python benchmark_faiss_twophase.py --total-index-gb 48 --dim 1536 \\
+    --pressure-profile spike --spike-peak-pct 80 --duration-seconds 300 \\
+    --csv-out outputs/twophase_spike.csv
+
+# Force a full rebuild of the index cache
+python benchmark_faiss_twophase.py --total-index-gb 0.5 --dim 128 --rebuild
+"""
+import argparse
+import csv
+import json
+import multiprocessing as mp
+import random
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import faiss
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Utilities (shared with the continuous benchmarks)
+# ---------------------------------------------------------------------------
+
+def percentile(sorted_values: List[float], pct: float) -> float:
+    if not sorted_values:
+        raise ValueError("No values to compute percentile")
+    if pct <= 0:
+        return sorted_values[0]
+    if pct >= 100:
+        return sorted_values[-1]
+    rank = (len(sorted_values) - 1) * (pct / 100.0)
+    lower = int(rank)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    w = rank - lower
+    return sorted_values[lower] * (1 - w) + sorted_values[upper] * w
+
+
+def get_mem_total_bytes() -> int:
+    """Total memory available, respecting cgroup limits when present."""
+    try:
+        with open("/sys/fs/cgroup/chromabench/memory.max", encoding="utf-8") as f:
+            v = f.read().strip()
+            if v != "max":
+                return int(v)
+    except (FileNotFoundError, PermissionError, ValueError):
+        pass
+    try:
+        with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", encoding="utf-8") as f:
+            v = int(f.read().strip())
+            if v < (1 << 62):
+                return v
+    except (FileNotFoundError, PermissionError, ValueError):
+        pass
+    with open("/proc/meminfo", encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    raise RuntimeError("Could not read MemTotal from /proc/meminfo")
+
+
+def memory_pressure_worker(
+    target_bytes: object,
+    actual_bytes: object,
+    stop_event: object,
+    chunk_bytes: int,
+    pause_seconds: float,
+    read_segment_pct: float = 0.0,
+    read_interval_seconds: float = 0.1,
+) -> None:
+    """Allocator process — identical to the continuous benchmark workers."""
+    chunks: List[bytearray] = []
+    allocated = 0
+    read_chunk_idx = 0
+    read_chunk_offset = 0
+    last_read_time = time.monotonic()
+
+    while not stop_event.is_set():
+        with target_bytes.get_lock():
+            desired = int(target_bytes.value)
+
+        while allocated < desired and not stop_event.is_set():
+            remaining = desired - allocated
+            size = chunk_bytes if remaining > chunk_bytes else remaining
+            if size <= 0:
+                break
+            chunk = bytearray(size)
+            for i in range(0, size, 4096):
+                chunk[i] = 0xAB
+            chunks.append(chunk)
+            allocated += size
+            with actual_bytes.get_lock():
+                actual_bytes.value = allocated
+
+        while allocated > desired and chunks:
+            removed = chunks.pop()
+            allocated -= len(removed)
+            if chunks:
+                read_chunk_idx = read_chunk_idx % len(chunks)
+                read_chunk_offset = min(read_chunk_offset, len(chunks[read_chunk_idx]) - 1)
+            else:
+                read_chunk_idx = 0
+                read_chunk_offset = 0
+        with actual_bytes.get_lock():
+            actual_bytes.value = allocated
+
+        now = time.monotonic()
+        if read_segment_pct > 0 and allocated > 0 and chunks and (now - last_read_time) >= read_interval_seconds:
+            last_read_time = now
+            bytes_remaining = max(1, int(allocated * read_segment_pct / 100.0))
+            while bytes_remaining > 0:
+                if read_chunk_idx >= len(chunks):
+                    read_chunk_idx = 0
+                    read_chunk_offset = 0
+                current_chunk = chunks[read_chunk_idx]
+                available = len(current_chunk) - read_chunk_offset
+                to_read = min(bytes_remaining, available)
+                _ = current_chunk[read_chunk_offset : read_chunk_offset + to_read]
+                read_chunk_offset += to_read
+                bytes_remaining -= to_read
+                if read_chunk_offset >= len(current_chunk):
+                    read_chunk_idx = (read_chunk_idx + 1) % len(chunks)
+                    read_chunk_offset = 0
+
+        time.sleep(pause_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Memory-budget sizing
+# ---------------------------------------------------------------------------
+
+def compute_num_vectors(total_gb: float, dim: int, m: int) -> int:
+    """Compute N so that both indexes together fit within *total_gb* GiB.
+
+    Memory model (approximate):
+      float32 store      = N × dim × 4  bytes
+      int8 SQ vectors    = N × dim × 1  byte
+      HNSW graph links   = N × 2 × M × 4 bytes  (int32 neighbor lists)
+      ───────────────────────────────────────────
+      total              ≈ N × (5×dim + 8×M)     bytes
+    """
+    total_bytes = total_gb * (1024 ** 3)
+    bytes_per_vector = 5 * dim + 8 * m
+    return max(1000, int(total_bytes / bytes_per_vector))
+
+
+def print_memory_budget(n: int, dim: int, m: int) -> None:
+    float32_gb = n * dim * 4 / (1024 ** 3)
+    int8_gb    = n * dim * 1 / (1024 ** 3)
+    graph_gb   = n * 2 * m * 4 / (1024 ** 3)
+    total_gb   = float32_gb + int8_gb + graph_gb
+    print(f"\n{'─'*52}")
+    print(f"  Index memory budget")
+    print(f"{'─'*52}")
+    print(f"  Vectors (N)     : {n:>12,}")
+    print(f"  Dimension       : {dim:>12,}")
+    print(f"  HNSW M          : {m:>12,}")
+    print(f"  float32 store   : {float32_gb:>11.3f} GiB   ({n * dim * 4 / 1e9:.2f} GB)")
+    print(f"  int8 SQ vectors : {int8_gb:>11.3f} GiB   ({n * dim * 1 / 1e9:.2f} GB)")
+    print(f"  HNSW graph      : {graph_gb:>11.3f} GiB   ({n * 2 * m * 4 / 1e9:.2f} GB)")
+    print(f"  ─────────────────────────────────────")
+    print(f"  Total (approx.) : {total_gb:>11.3f} GiB")
+    print(f"{'─'*52}\n")
+
+
+# ---------------------------------------------------------------------------
+# Data generation
+# ---------------------------------------------------------------------------
+
+def generate_vectors(n: int, dim: int, rng: np.random.Generator) -> np.ndarray:
+    """Generate L2-normalised float32 vectors (unit sphere) so cosine ≈ L2."""
+    vecs = rng.standard_normal((n, dim)).astype(np.float32)
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    return (vecs / norms).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Index construction
+# ---------------------------------------------------------------------------
+
+def build_indexes(
+    data: np.ndarray,
+    m: int,
+    ef_construction: int,
+    ef_search: int,
+    metric: int = faiss.METRIC_L2,
+) -> faiss.IndexHNSWSQ:
+    """Build and return a trained FAISS IndexHNSWSQ (int8 HNSW).
+
+    The float32 data array serves as the companion rerank store; it is kept
+    in the caller's memory and NOT duplicated inside this function.
+    """
+    n, dim = data.shape
+    print(f"Building IndexHNSWSQ (QT_8bit, M={m}, ef_construction={ef_construction}) on {n:,} vectors…")
+
+    index = faiss.IndexHNSWSQ(dim, faiss.ScalarQuantizer.QT_8bit, m, metric)
+    index.hnsw.efConstruction = ef_construction
+    index.hnsw.efSearch = ef_search
+
+    train_n = min(n, 50_000)
+    print(f"  Training scalar quantizer on {train_n:,} vectors…")
+    index.train(data[:train_n])
+    print(f"  Adding {n:,} vectors…")
+
+    batch = 100_000
+    for start in range(0, n, batch):
+        index.add(data[start : start + batch])
+        if start > 0 and start % 500_000 == 0:
+            print(f"    added {start:,} / {n:,}")
+
+    print(f"  Index built: {index.ntotal:,} vectors stored")
+    return index
+
+
+# ---------------------------------------------------------------------------
+# Index persistence
+# ---------------------------------------------------------------------------
+
+def _cache_meta(n: int, dim: int, m: int, ef_construction: int, seed: int) -> dict:
+    return {"n_vectors": n, "dim": dim, "m": m, "ef_construction": ef_construction, "seed": seed}
+
+
+def _cache_paths(cache_dir: "Path"):
+    return (
+        cache_dir / "index.faiss",
+        cache_dir / "vectors.npy",
+        cache_dir / "queries.npy",
+        cache_dir / "meta.json",
+    )
+
+
+def try_load_cache(
+    cache_dir: "Path", n: int, dim: int, m: int, ef_construction: int, seed: int, ef_search: int
+) -> Optional[tuple]:
+    """Return (int8_index, float32_store, query_pool) from cache, or None if stale/missing.
+
+    float32_store is memory-mapped (read-only), so only touched pages are loaded
+    into RAM — useful for studying OS page-eviction behaviour under pressure.
+    """
+    idx_path, vec_path, qry_path, meta_path = _cache_paths(cache_dir)
+    if not all(p.exists() for p in (idx_path, vec_path, qry_path, meta_path)):
+        return None
+    try:
+        with meta_path.open() as f:
+            saved = json.load(f)
+    except Exception:
+        return None
+    if saved != _cache_meta(n, dim, m, ef_construction, seed):
+        print("Cache found but parameters differ — rebuilding.")
+        return None
+    print(f"Loading cached index from: {cache_dir}")
+    int8_index = faiss.read_index(str(idx_path))
+    int8_index.hnsw.efSearch = ef_search
+    float32_store = np.load(str(vec_path), mmap_mode="r")
+    query_pool = np.load(str(qry_path))
+    print(f"  Loaded {int8_index.ntotal:,} vectors  (float32 store memory-mapped)")
+    return int8_index, float32_store, query_pool
+
+
+def save_cache(
+    cache_dir: "Path",
+    int8_index: faiss.IndexHNSWSQ,
+    float32_store: np.ndarray,
+    query_pool: np.ndarray,
+    n: int, dim: int, m: int, ef_construction: int, seed: int,
+) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    idx_path, vec_path, qry_path, meta_path = _cache_paths(cache_dir)
+    print(f"Saving index cache to: {cache_dir}")
+    faiss.write_index(int8_index, str(idx_path))
+    np.save(str(vec_path), float32_store)
+    np.save(str(qry_path), query_pool)
+    with meta_path.open("w") as fh:
+        json.dump(_cache_meta(n, dim, m, ef_construction, seed), fh, indent=2)
+    print(f"  Saved {int8_index.ntotal:,} vectors")
+
+
+# ---------------------------------------------------------------------------
+# Two-pass query
+# ---------------------------------------------------------------------------
+
+def two_pass_query(
+    int8_index: faiss.IndexHNSWSQ,
+    float32_store: np.ndarray,
+    query: np.ndarray,
+    top_k: int,
+    candidate_mult: int,
+    rerank: bool,
+) -> Tuple[np.ndarray, float, float, float]:
+    """Execute one query and return (result_ids, total_ms, pass1_ms, pass2_ms).
+
+    Parameters
+    ----------
+    int8_index      : Trained IndexHNSWSQ
+    float32_store   : (N, dim) float32 array — original (unreduced) vectors
+    query           : (dim,) float32 query vector
+    top_k           : Final number of results to return
+    candidate_mult  : Pass-1 oversampling: fetch top_k * candidate_mult candidates
+    rerank          : True → run pass 2; False → return pass-1 results directly
+    """
+    q = query.reshape(1, -1).astype(np.float32)
+
+    # ── Pass 1: coarse int8 search ──────────────────────────────────────────
+    n_candidates = top_k * candidate_mult if rerank else top_k
+    t0 = time.perf_counter()
+    _, ids = int8_index.search(q, n_candidates)
+    pass1_ms = (time.perf_counter() - t0) * 1000.0
+
+    ids = ids[0]
+    valid_ids = ids[ids >= 0]  # FAISS returns -1 for unfilled slots
+
+    if not rerank or len(valid_ids) == 0:
+        total_ms = pass1_ms
+        return valid_ids[:top_k], total_ms, pass1_ms, 0.0
+
+    # ── Pass 2: exact float32 re-rank ───────────────────────────────────────
+    t1 = time.perf_counter()
+    candidate_vecs = float32_store[valid_ids]            # (C, dim)
+    diffs = candidate_vecs - query[np.newaxis, :]        # (C, dim)
+    dists = np.einsum("ij,ij->i", diffs, diffs)          # (C,) L2²
+    order = np.argsort(dists)
+    result_ids = valid_ids[order[:top_k]]
+    pass2_ms = (time.perf_counter() - t1) * 1000.0
+
+    total_ms = pass1_ms + pass2_ms
+    return result_ids, total_ms, pass1_ms, pass2_ms
+
+
+# ---------------------------------------------------------------------------
+# CSV output
+# ---------------------------------------------------------------------------
+
+def maybe_write_csv(path: Optional[str], rows: List[dict]) -> None:
+    if not path:
+        return
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "query_index",
+        "elapsed_sec",
+        "target_pressure_pct",
+        "actual_pressure_pct",
+        "latency_ms",
+        "pass1_ms",
+        "pass2_ms",
+        "reranked",
+        "rerank_skipped",
+        "n_candidates",
+    ]
+    with out_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Pressure profiles (identical to continuous benchmarks)
+# ---------------------------------------------------------------------------
+
+def make_ramp_profile(start_pct: float, end_pct: float, ramp_seconds: float):
+    def _profile(elapsed: float) -> float:
+        progress = min(elapsed / ramp_seconds, 1.0)
+        return start_pct + (end_pct - start_pct) * progress
+    return _profile
+
+
+def make_spike_profile(
+    baseline_pct: float,
+    peak_pct: float,
+    rise_seconds: float,
+    hold_seconds: float,
+    fall_seconds: float,
+    idle_seconds: float,
+):
+    period = rise_seconds + hold_seconds + fall_seconds + idle_seconds
+
+    def _profile(elapsed: float) -> float:
+        phase = elapsed % period
+        if phase < rise_seconds:
+            return baseline_pct + (peak_pct - baseline_pct) * (phase / rise_seconds)
+        phase -= rise_seconds
+        if phase < hold_seconds:
+            return peak_pct
+        phase -= hold_seconds
+        if phase < fall_seconds:
+            return peak_pct + (baseline_pct - peak_pct) * (phase / fall_seconds)
+        return baseline_pct
+
+    return _profile
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+    )
+
+    # ── Index / data ──────────────────────────────────────────────────────
+    g = parser.add_argument_group("index / data")
+    g.add_argument(
+        "--total-index-gb", type=float, default=1.0,
+        help="Combined memory budget for both indexes in GiB (default: 1.0). "
+             "On 8 GB WSL try 0.5; on 128 GB bare metal try 48–96.",
+    )
+    g.add_argument("--dim", type=int, default=128,
+                   help="Embedding dimension (default: 128)")
+    g.add_argument("--m", type=int, default=16,
+                   help="HNSW M parameter — controls graph connectivity (default: 16)")
+    g.add_argument("--ef-construction", type=int, default=200,
+                   help="HNSW ef_construction — index build quality (default: 200)")
+    g.add_argument("--ef-search", type=int, default=64,
+                   help="HNSW ef_search — query-time beam width (default: 64)")
+    g.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    g.add_argument(
+        "--index-cache-dir", default="index_cache",
+        help="Directory to cache the built FAISS index and float32 store (default: index_cache). "
+             "Cache is reused automatically when N, dim, M, ef_construction, and seed all match.",
+    )
+    g.add_argument(
+        "--rebuild", action="store_true",
+        help="Force a full rebuild even if a valid cache exists in --index-cache-dir",
+    )
+
+    # ── Two-pass behaviour ───────────────────────────────────────────────
+    g2 = parser.add_argument_group("two-pass behaviour")
+    g2.add_argument("--top-k", type=int, default=10,
+                    help="Final number of results returned per query (default: 10)")
+    g2.add_argument(
+        "--candidate-mult", type=int, default=5,
+        help="Pass-1 oversampling factor: fetch top_k × candidate_mult candidates "
+             "before exact re-rank (default: 5)",
+    )
+    g2.add_argument(
+        "--rerank-threshold-pct", type=float, default=60.0,
+        help="Skip pass-2 re-rank when actual memory pressure exceeds this %% of "
+             "total RAM (default: 60.0). Set to 0 to always skip; 100 to always rerank.",
+    )
+    # ── Benchmark timing ─────────────────────────────────────────────────
+    g3 = parser.add_argument_group("benchmark timing")
+    g3.add_argument("--duration-seconds", type=float, default=120.0,
+                    help="Total benchmark runtime in seconds (default: 120)")
+    g3.add_argument("--query-pool-size", type=int, default=1000,
+                    help="Number of pre-generated query vectors (default: 1000)")
+    g3.add_argument("--query-interval-ms", type=float, default=0.0,
+                    help="Optional sleep between queries in ms (default: 0)")
+
+    # ── Memory pressure ──────────────────────────────────────────────────
+    g4 = parser.add_argument_group("memory pressure")
+    g4.add_argument(
+        "--pressure-profile", choices=["ramp", "spike"], default="ramp",
+        help="Pressure shape: 'ramp' (linear, default) or 'spike' (periodic pulses)",
+    )
+    g4.add_argument("--pressure-start-pct", type=float, default=0.0,
+                    help="[ramp] Starting allocator pressure %% of total RAM (default: 0)")
+    g4.add_argument("--pressure-end-pct", type=float, default=75.0,
+                    help="[ramp] Ending allocator pressure %% of total RAM (default: 75)")
+    g4.add_argument("--ramp-seconds", type=float, default=120.0,
+                    help="[ramp] How long to complete the ramp (default: 120 s)")
+    g4.add_argument("--spike-baseline-pct", type=float, default=0.0,
+                    help="[spike] Pressure %% at idle (default: 0)")
+    g4.add_argument("--spike-peak-pct", type=float, default=70.0,
+                    help="[spike] Peak pressure %% (default: 70)")
+    g4.add_argument("--spike-rise-seconds", type=float, default=5.0,
+                    help="[spike] Seconds to ramp baseline→peak (default: 5)")
+    g4.add_argument("--spike-hold-seconds", type=float, default=10.0,
+                    help="[spike] Seconds to hold peak (default: 10)")
+    g4.add_argument("--spike-fall-seconds", type=float, default=5.0,
+                    help="[spike] Seconds to fall peak→baseline (default: 5)")
+    g4.add_argument("--spike-idle-seconds", type=float, default=20.0,
+                    help="[spike] Seconds to idle at baseline before repeating (default: 20)")
+    g4.add_argument("--chunk-mb", type=int, default=64,
+                    help="Allocator chunk size in MiB (default: 64)")
+    g4.add_argument("--allocator-pause-ms", type=float, default=25.0,
+                    help="Allocator sleep between allocation checks in ms (default: 25)")
+    g4.add_argument(
+        "--read-segment-pct", type=float, default=0.0,
+        help="Rolling read-through: scan this %% of allocated memory per cycle "
+             "to keep pages active and compete with the query workload (default: 0 = off)",
+    )
+    g4.add_argument("--read-interval-ms", type=float, default=100.0,
+                    help="Minimum time between read sweeps in ms (default: 100)")
+
+    # ── Output ────────────────────────────────────────────────────────────
+    g5 = parser.add_argument_group("output")
+    g5.add_argument(
+        "--csv-out", default="outputs/twophase_results.csv",
+        help="CSV file for per-query results (default: outputs/twophase_results.csv)",
+    )
+    g5.add_argument("--plot-window", type=int, default=200,
+                    help="Rolling window size for the auto-generated plot (default: 200)")
+
+    args = parser.parse_args()
+
+    # ── Validation ────────────────────────────────────────────────────────
+    if args.total_index_gb <= 0:
+        raise ValueError("--total-index-gb must be > 0")
+    if args.dim < 2:
+        raise ValueError("--dim must be >= 2")
+    if args.m < 2:
+        raise ValueError("--m must be >= 2")
+    if args.ef_construction < args.m:
+        raise ValueError("--ef-construction must be >= --m")
+    if args.ef_search < 1:
+        raise ValueError("--ef-search must be >= 1")
+    if args.top_k < 1:
+        raise ValueError("--top-k must be >= 1")
+    if args.candidate_mult < 1:
+        raise ValueError("--candidate-mult must be >= 1")
+    if not (0.0 <= args.rerank_threshold_pct <= 100.0):
+        raise ValueError("--rerank-threshold-pct must be in [0, 100]")
+    if args.duration_seconds <= 0:
+        raise ValueError("--duration-seconds must be > 0")
+    if args.query_pool_size < 1:
+        raise ValueError("--query-pool-size must be >= 1")
+    if args.query_interval_ms < 0:
+        raise ValueError("--query-interval-ms must be >= 0")
+    if args.pressure_start_pct < 0 or args.pressure_start_pct > 95:
+        raise ValueError("--pressure-start-pct must be in [0, 95]")
+    if args.pressure_end_pct < 0 or args.pressure_end_pct > 95:
+        raise ValueError("--pressure-end-pct must be in [0, 95]")
+    if args.ramp_seconds <= 0:
+        raise ValueError("--ramp-seconds must be > 0")
+    if args.chunk_mb < 1:
+        raise ValueError("--chunk-mb must be >= 1")
+    if args.read_segment_pct < 0 or args.read_segment_pct > 100:
+        raise ValueError("--read-segment-pct must be in [0, 100]")
+    if args.read_interval_ms <= 0:
+        raise ValueError("--read-interval-ms must be > 0")
+    if args.pressure_profile == "spike":
+        if not (0 <= args.spike_baseline_pct <= 95):
+            raise ValueError("--spike-baseline-pct must be in [0, 95]")
+        if not (args.spike_baseline_pct < args.spike_peak_pct <= 95):
+            raise ValueError("--spike-peak-pct must be > --spike-baseline-pct and <= 95")
+        for flag, val in [
+            ("--spike-rise-seconds", args.spike_rise_seconds),
+            ("--spike-hold-seconds", args.spike_hold_seconds),
+            ("--spike-fall-seconds", args.spike_fall_seconds),
+        ]:
+            if val <= 0:
+                raise ValueError(f"{flag} must be > 0")
+        if args.spike_idle_seconds < 0:
+            raise ValueError("--spike-idle-seconds must be >= 0")
+
+    # ── Setup ─────────────────────────────────────────────────────────────
+    rng = np.random.default_rng(args.seed)
+    random.seed(args.seed)
+
+    n_vectors = compute_num_vectors(args.total_index_gb, args.dim, args.m)
+    print_memory_budget(n_vectors, args.dim, args.m)
+
+    mem_total_bytes = get_mem_total_bytes()
+    print(f"System/cgroup total RAM : {mem_total_bytes / (1024**3):.2f} GiB")
+
+    # ── Generate data / load from cache ───────────────────────────────────
+    cache_dir = Path(args.index_cache_dir)
+    loaded = None if args.rebuild else try_load_cache(
+        cache_dir, n_vectors, args.dim, args.m, args.ef_construction, args.seed, args.ef_search
+    )
+
+    if loaded is not None:
+        int8_index, float32_store, query_pool = loaded
+    else:
+        print(f"Generating {n_vectors:,} × dim-{args.dim} float32 vectors…")
+        float32_store = generate_vectors(n_vectors, args.dim, rng)
+
+        print(f"Generating {args.query_pool_size} query vectors…")
+        query_pool = generate_vectors(args.query_pool_size, args.dim, rng)
+
+        int8_index = build_indexes(
+            float32_store, args.m, args.ef_construction, args.ef_search
+        )
+        save_cache(
+            cache_dir, int8_index, float32_store, query_pool,
+            n_vectors, args.dim, args.m, args.ef_construction, args.seed,
+        )
+
+    # ── Pressure profile ──────────────────────────────────────────────────
+    if args.pressure_profile == "ramp":
+        profile_fn = make_ramp_profile(
+            args.pressure_start_pct, args.pressure_end_pct, args.ramp_seconds
+        )
+    else:
+        profile_fn = make_spike_profile(
+            args.spike_baseline_pct, args.spike_peak_pct,
+            args.spike_rise_seconds, args.spike_hold_seconds,
+            args.spike_fall_seconds, args.spike_idle_seconds,
+        )
+
+    # ── Allocator process ─────────────────────────────────────────────────
+    target_bytes = mp.Value("Q", 0)
+    actual_bytes = mp.Value("Q", 0)
+    stop_event = mp.Event()
+
+    pressure_proc = mp.Process(
+        target=memory_pressure_worker,
+        args=(
+            target_bytes,
+            actual_bytes,
+            stop_event,
+            args.chunk_mb * 1024 * 1024,
+            args.allocator_pause_ms / 1000.0,
+            args.read_segment_pct,
+            args.read_interval_ms / 1000.0,
+        ),
+        daemon=True,
+    )
+
+    # ── Query loop ─────────────────────────────────────────────────────────
+    rows: List[dict] = []
+    latencies: List[float] = []
+    rerank_count = 0
+    pass1_only_count = 0
+
+    pressure_proc.start()
+    start = time.perf_counter()
+    next_report = 50
+    query_index = 0
+
+    print(f"\nStarting benchmark  [{args.duration_seconds:.0f}s, {args.pressure_profile} profile]")
+    print(f"  Rerank skipped when actual pressure >= {args.rerank_threshold_pct:.1f}%")
+    print(f"  Candidate multiplier: {args.candidate_mult}× ({args.top_k}→{args.top_k * args.candidate_mult} candidates)")
+    print()
+
+    try:
+        while True:
+            now = time.perf_counter()
+            elapsed = now - start
+            if elapsed >= args.duration_seconds:
+                break
+
+            # Update allocator target
+            target_pct = profile_fn(elapsed)
+            target_b = int((target_pct / 100.0) * mem_total_bytes)
+            with target_bytes.get_lock():
+                target_bytes.value = target_b
+            with actual_bytes.get_lock():
+                actual_b = int(actual_bytes.value)
+
+            actual_pct = (actual_b / mem_total_bytes) * 100.0 if mem_total_bytes else 0.0
+
+            # Decide whether to rerank
+            do_rerank = actual_pct < args.rerank_threshold_pct
+
+            query_vec = query_pool[query_index % args.query_pool_size]
+
+            result_ids, total_ms, pass1_ms, pass2_ms = two_pass_query(
+                int8_index, float32_store, query_vec,
+                args.top_k, args.candidate_mult, do_rerank,
+            )
+
+            latencies.append(total_ms)
+            if do_rerank:
+                rerank_count += 1
+            else:
+                pass1_only_count += 1
+            query_index += 1
+
+            rows.append({
+                "query_index": query_index,
+                "elapsed_sec": round(elapsed, 4),
+                "target_pressure_pct": round(target_pct, 3),
+                "actual_pressure_pct": round(actual_pct, 3),
+                "latency_ms": round(total_ms, 4),
+                "pass1_ms": round(pass1_ms, 4),
+                "pass2_ms": round(pass2_ms, 4),
+                "reranked": "yes" if do_rerank else "no",
+                "rerank_skipped": "yes" if not do_rerank else "no",
+                "n_candidates": len(result_ids),
+            })
+
+            if query_index >= next_report:
+                recent = latencies[max(0, len(latencies) - 50):]
+                s = sorted(recent)
+                p50 = percentile(s, 50)
+                p99 = percentile(s, 99)
+                print(
+                    f"q={query_index:>7,} | t={elapsed:6.1f}s | "
+                    f"target={target_pct:5.1f}% | actual={actual_pct:5.1f}% | "
+                    f"rerank={'Y' if do_rerank else 'N'} | "
+                    f"p50={p50:.3f}ms p99={p99:.3f}ms"
+                )
+                next_report += 50
+
+            if args.query_interval_ms > 0:
+                time.sleep(args.query_interval_ms / 1000.0)
+
+    finally:
+        stop_event.set()
+        pressure_proc.join(timeout=5)
+        if pressure_proc.is_alive():
+            pressure_proc.terminate()
+            pressure_proc.join(timeout=5)
+
+    if not latencies:
+        raise RuntimeError("No queries were executed; check duration/interval settings")
+
+    sorted_lat = sorted(latencies)
+    avg_lat = statistics.mean(sorted_lat)
+    p50 = percentile(sorted_lat, 50)
+    p99 = percentile(sorted_lat, 99)
+
+    print(f"\n{'═'*52}")
+    print("  Two-Phase FAISS Benchmark Results")
+    print(f"{'═'*52}")
+    print(f"  Queries executed  : {len(sorted_lat):>10,}")
+    print(f"  Two-pass (rerank) : {rerank_count:>10,}  ({100*rerank_count/len(sorted_lat):.1f}%)")
+    print(f"  Pass-1 only       : {pass1_only_count:>10,}  ({100*pass1_only_count/len(sorted_lat):.1f}%)")
+    print(f"  Latency avg       : {avg_lat:>10.3f} ms")
+    print(f"  Latency P50       : {p50:>10.3f} ms")
+    print(f"  Latency P99       : {p99:>10.3f} ms")
+    print(f"  Latency min/max   : {sorted_lat[0]:.3f} / {sorted_lat[-1]:.3f} ms")
+    print(f"{'═'*52}")
+
+    maybe_write_csv(args.csv_out, rows)
+    if args.csv_out:
+        print(f"\nWrote CSV: {args.csv_out}")
+        csv_path = Path(args.csv_out)
+        png_path = csv_path.with_suffix(".png")
+        plot_script = Path(__file__).parent / "plot_continuous_results.py"
+        try:
+            subprocess.run(
+                [
+                    sys.executable, str(plot_script),
+                    "--csv", str(csv_path),
+                    "--out", str(png_path),
+                    "--window", str(args.plot_window),
+                    "--latency-y-max", "15",
+                ],
+                check=True,
+            )
+            print(f"Plot saved: {png_path}")
+        except Exception as exc:
+            print(f"Warning: plot generation failed: {exc}")
+
+
+if __name__ == "__main__":
+    main()

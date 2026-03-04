@@ -1,3 +1,5 @@
 chroma_data/
 __pycache__/
 .vscode/
+index_cache/
+index_cache_float32/

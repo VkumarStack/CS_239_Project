@@ -22,14 +22,20 @@ def load_csv(csv_path: Path):
     """Load benchmark CSV.
 
     Returns a tuple of:
-        (elapsed, latency, target_pressure, actual_pressure, ef_search_or_None)
-    where ef_search_or_None is a numpy int array when the column is present, else None.
+        (elapsed, latency, target_pressure, actual_pressure,
+         ef_search_or_None, reranked_or_None, recall_or_None)
+
+    reranked_or_None : bool ndarray — True where rerank was performed ("yes"),
+                       present only when the ``reranked`` column exists.
+    recall_or_None   : float ndarray with NaN for rows where recall was not
+                       computed, present only when the ``recall_at_k`` column exists.
     """
     elapsed = []
     latency = []
     target_pressure = []
     actual_pressure = []
     ef_search_vals = []
+    reranked_vals = []
 
     with csv_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
@@ -45,7 +51,9 @@ def load_csv(csv_path: Path):
                 "elapsed_sec, latency_ms, target_pressure_pct, actual_pressure_pct"
             )
 
-        has_ef_search = "ef_search" in (reader.fieldnames or [])
+        fields = set(reader.fieldnames or [])
+        has_ef_search = "ef_search" in fields
+        has_reranked  = "reranked"   in fields
 
         for row in reader:
             elapsed.append(float(row["elapsed_sec"]))
@@ -54,6 +62,9 @@ def load_csv(csv_path: Path):
             actual_pressure.append(float(row["actual_pressure_pct"]))
             if has_ef_search:
                 ef_search_vals.append(int(row["ef_search"]))
+            if has_reranked:
+                v = row["reranked"].strip().lower()
+                reranked_vals.append(v in ("yes", "1", "true"))
 
     if not elapsed:
         raise ValueError("CSV has no data rows")
@@ -64,6 +75,7 @@ def load_csv(csv_path: Path):
         np.array(target_pressure),
         np.array(actual_pressure),
         np.array(ef_search_vals, dtype=int) if ef_search_vals else None,
+        np.array(reranked_vals, dtype=bool) if reranked_vals else None,
     )
 
 
@@ -78,15 +90,11 @@ def make_plot(
     no_scatter: bool = False,
 ) -> None:
     """Generate and save the benchmark plot."""
-    elapsed, latency, target_pressure, actual_pressure, ef_search = load_csv(csv_path)
+    elapsed, latency, target_pressure, actual_pressure, ef_search, reranked = load_csv(csv_path)
 
     roll_p50 = rolling_percentile(latency, window, 50)
     roll_p99 = rolling_percentile(latency, window, 99)
 
-    # Auto-compute latency y-axis limits from the data when not explicitly provided.
-    # Bottom: the minimum observed latency.
-    # Top: max(peak rolling-P99, 20 × floor rolling-P99) — shows the worst spike
-    #      while keeping the scale sane when spikes are modest.
     min_latency = float(np.min(latency))
     y_min = latency_y_min if latency_y_min is not None else min_latency
     if latency_y_max is not None:
@@ -96,39 +104,74 @@ def make_plot(
         min_p99 = float(np.nanmin(roll_p99))
         y_max = max(max_p99, min_p99 * 10.0)
 
-    has_ef = ef_search is not None
-    n_rows = 3 if has_ef else 2
-    fig_height = 12 if has_ef else 8
+    has_ef     = ef_search is not None
+    has_rerank = reranked is not None
+
+    # Build subplot grid: latency | [rerank status] | [ef_search] | pressure
+    n_rows     = 2 + int(has_ef) + int(has_rerank)
+    fig_height = 4 * n_rows
 
     fig, axes = plt.subplots(n_rows, 1, figsize=(12, fig_height), sharex=True)
+    # Always index axes as a list for consistent access
+    axes = list(axes) if n_rows > 1 else [axes]
+    ax_iter = iter(axes)
 
-    ax_lat = axes[0]
+    # ── Latency subplot ────────────────────────────────────────────────────
+    ax_lat = next(ax_iter)
     if not no_scatter:
-        ax_lat.scatter(elapsed, latency, s=4, alpha=0.2, label="Latency (raw)")
+        if has_rerank:
+            skip_mask = ~reranked
+            ax_lat.scatter(
+                elapsed[reranked], latency[reranked],
+                s=4, alpha=0.2, color="tab:blue", label="Latency – reranked",
+            )
+            ax_lat.scatter(
+                elapsed[skip_mask], latency[skip_mask],
+                s=4, alpha=0.3, color="tab:orange", label="Latency – rerank skipped",
+            )
+        else:
+            ax_lat.scatter(elapsed, latency, s=4, alpha=0.2, label="Latency (raw)")
+
     ax_lat.plot(elapsed, roll_p50, linewidth=2, label=f"Rolling P50 (window={window})")
     ax_lat.plot(elapsed, roll_p99, linewidth=2, label=f"Rolling P99 (window={window})")
+
     ax_lat.set_ylabel("Latency (ms)")
-    ax_lat.set_title("Chroma Query Latency Over Time")
+    ax_lat.set_title("Query Latency Over Time")
     ax_lat.grid(alpha=0.25)
-    ax_lat.legend(loc="upper left")
+    ax_lat.legend(loc="upper left", fontsize=8)
     ax_lat.set_ylim(bottom=y_min, top=y_max)
 
+    # ── Rerank status subplot ──────────────────────────────────────────────
+    if has_rerank:
+        ax_rr = next(ax_iter)
+        rerank_signal = reranked.astype(int)   # 1 = reranking active, 0 = skipped
+        ax_rr.step(elapsed, rerank_signal, linewidth=1.5, where="post",
+                   color="tab:blue", label="Rerank active (1) / skipped (0)")
+        ax_rr.fill_between(elapsed, 0, rerank_signal,
+                           step="post", alpha=0.15, color="tab:blue")
+        ax_rr.set_ylabel("Reranking")
+        ax_rr.set_yticks([0, 1])
+        ax_rr.set_yticklabels(["Skipped", "Active"])
+        ax_rr.set_ylim(-0.1, 1.3)
+        ax_rr.set_title("Rerank Status Over Time")
+        ax_rr.grid(alpha=0.25)
+
+    # ── ef_search subplot (adaptive benchmark only) ────────────────────────
     if has_ef:
-        ax_ef = axes[1]
+        ax_ef = next(ax_iter)
         ax_ef.step(elapsed, ef_search, linewidth=2, where="post", label="ef_search", color="tab:purple")
         ax_ef.set_ylabel("ef_search")
         ax_ef.set_title("Adaptive ef_search Over Time")
         ax_ef.grid(alpha=0.25)
         ax_ef.legend(loc="upper left")
-        ax_press = axes[2]
-    else:
-        ax_press = axes[1]
 
+    # ── Memory pressure subplot ────────────────────────────────────────────
+    ax_press = next(ax_iter)
     ax_press.plot(elapsed, target_pressure, linewidth=2, label="Target pressure %")
     ax_press.plot(elapsed, actual_pressure, linewidth=2, label="Actual pressure %")
     ax_press.set_xlabel("Elapsed time (s)")
     ax_press.set_ylabel("Memory pressure (%)")
-    ax_press.set_title("Memory Pressure Ramp")
+    ax_press.set_title("Memory Pressure")
     ax_press.grid(alpha=0.25)
     ax_press.legend(loc="upper left")
     if pressure_y_min is not None or pressure_y_max is not None:
