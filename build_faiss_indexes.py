@@ -35,8 +35,9 @@ Index types
              → compatible with: benchmark_faiss_baseline.py --index-type int8
 
   all        Build all three.  vectors.npy and queries.npy are generated once
-             and symlinked (or hard-copied) into the float32 and int8 dirs so
-             --shared-data-dir still works correctly.
+             in the two-phase dir and hard-linked into the float32 and int8 dirs
+             (zero extra disk space; falls back to a full copy if src and dst
+             are on different filesystems).
 
 Memory budget (informational — N is set explicitly via --n-vectors or via
 --total-index-gb using the same formula as the benchmark scripts)
@@ -60,6 +61,7 @@ Usage examples
 """
 import argparse
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -67,6 +69,21 @@ from typing import Optional
 
 import faiss
 import numpy as np
+
+
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """Hard-link src → dst (zero extra disk space).
+
+    Falls back to shutil.copy2 if src and dst are on different filesystems
+    (os.link raises OSError/errno.EXDEV in that case).
+    """
+    dst.unlink(missing_ok=True)
+    try:
+        os.link(src, dst)
+        print(f"  Hard-linked vectors.npy → {dst}")
+    except OSError:
+        print(f"  Hard-link not possible (cross-device); falling back to full copy…")
+        shutil.copy2(str(src), str(dst))
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +310,8 @@ def write_cache(
     # vectors.npy
     dst_vec = cache_dir / "vectors.npy"
     if vec_src is not None and vec_src != dst_vec:
-        print(f"  Copying vectors.npy → {dst_vec}  ({vec_src.stat().st_size / (1024**3):.2f} GiB)…")
-        shutil.copy2(str(vec_src), str(dst_vec))
+        print(f"  Linking vectors.npy → {dst_vec}  ({vec_src.stat().st_size / (1024**3):.2f} GiB)…")
+        _link_or_copy(vec_src, dst_vec)
 
     # index.faiss
     idx_path = cache_dir / "index.faiss"
@@ -392,11 +409,10 @@ def build_float32(args, n: int, rng: np.random.Generator, cache_dir: Path, queri
     vec_path = cache_dir / "vectors.npy"
 
     if shared_vec_path is not None and shared_vec_path.exists():
-        if vec_path.exists() and vec_path.stat().st_size == shared_vec_path.stat().st_size:
-            print(f"  vectors.npy already present in {cache_dir} — skipping copy.")
+        if vec_path.exists() and os.path.samefile(str(vec_path), str(shared_vec_path)):
+            print(f"  vectors.npy already hard-linked in {cache_dir} — skipping.")
         else:
-            print(f"  Copying shared vectors.npy from {shared_vec_path}…")
-            shutil.copy2(str(shared_vec_path), str(vec_path))
+            _link_or_copy(shared_vec_path, vec_path)
     elif not vec_path.exists():
         generate_and_save_vectors_chunked(n, args.dim, rng, vec_path, args.build_chunk_size)
 
@@ -418,11 +434,10 @@ def build_int8(args, n: int, rng: np.random.Generator, cache_dir: Path, queries:
     vec_path = cache_dir / "vectors.npy"
 
     if shared_vec_path is not None and shared_vec_path.exists():
-        if vec_path.exists() and vec_path.stat().st_size == shared_vec_path.stat().st_size:
-            print(f"  vectors.npy already present in {cache_dir} — skipping copy.")
+        if vec_path.exists() and os.path.samefile(str(vec_path), str(shared_vec_path)):
+            print(f"  vectors.npy already hard-linked in {cache_dir} — skipping.")
         else:
-            print(f"  Copying shared vectors.npy from {shared_vec_path}…")
-            shutil.copy2(str(shared_vec_path), str(vec_path))
+            _link_or_copy(shared_vec_path, vec_path)
     elif not vec_path.exists():
         generate_and_save_vectors_chunked(n, args.dim, rng, vec_path, args.build_chunk_size)
 
