@@ -13,41 +13,31 @@ Supports two index types (selected via --index-type):
             Stores float32 vectors natively inside the index; no separate
             rerank store.  Ground-truth latency baseline.
 
-Memory budget formulae
-----------------------
-  float32 HNSW  : N × (4×dim + 8×M) bytes
-  int8 HNSW     : N × (  dim + 8×M) bytes
+Usage
+-----
+Build indexes first with build_faiss_indexes.py, then run this benchmark:
 
-Sharing data with the two-phase benchmark
------------------------------------------
-Point --shared-data-dir at the two-phase cache directory and this script
-will reuse the same vectors.npy and queries.npy, only rebuilding the FAISS
-index.  This lets you compare all three approaches on an identical dataset.
+  # Build all three index types at once
+  python build_faiss_indexes.py --type all --total-index-gb 0.5 --dim 128
 
-  # Build two-phase cache first (or reuse existing)
-  python benchmark_faiss_twophase.py --total-index-gb 0.5 --dim 128 --duration-seconds 1
-
-  # Float32 baseline on the same dataset
-  python benchmark_faiss_baseline.py --index-type float32 --shared-data-dir index_cache \\
-      --total-index-gb 0.5 --dim 128 \\
+  # Float32 baseline
+  python benchmark_faiss_baseline.py --index-type float32 \\
       --pressure-profile spike --spike-peak-pct 80 --duration-seconds 100
 
-  # Int8-only on the same dataset
-  python benchmark_faiss_baseline.py --index-type int8 --shared-data-dir index_cache \\
-      --total-index-gb 0.5 --dim 128 \\
+  # Int8-only baseline
+  python benchmark_faiss_baseline.py --index-type int8 \\
       --pressure-profile spike --spike-peak-pct 80 --duration-seconds 100
 """
 import argparse
 import csv
 import json
 import multiprocessing as mp
-import random
 import statistics
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import faiss
 import numpy as np
@@ -157,23 +147,6 @@ def memory_pressure_worker(
         time.sleep(pause_seconds)
 
 
-# ---------------------------------------------------------------------------
-# Memory-budget sizing
-# ---------------------------------------------------------------------------
-
-def compute_num_vectors(total_gb: float, dim: int, m: int, index_type: str) -> int:
-    """Compute N so the index fits within *total_gb* GiB.
-
-    float32 HNSW : N × (4×dim + 8×M)  bytes
-    int8 HNSW    : N × (  dim + 8×M)  bytes
-    """
-    total_bytes = total_gb * (1024 ** 3)
-    if index_type == "float32":
-        bytes_per_vector = 4 * dim + 8 * m
-    else:  # int8
-        bytes_per_vector = dim + 8 * m
-    return max(1000, int(total_bytes / bytes_per_vector))
-
 
 def print_memory_budget(n: int, dim: int, m: int, index_type: str) -> None:
     if index_type == "float32":
@@ -195,53 +168,6 @@ def print_memory_budget(n: int, dim: int, m: int, index_type: str) -> None:
     print(f"  ─────────────────────────────────────")
     print(f"  Total (approx.) : {total_gb:>11.3f} GiB")
     print(f"{'─'*52}\n")
-
-
-# ---------------------------------------------------------------------------
-# Data generation
-# ---------------------------------------------------------------------------
-
-def generate_vectors(n: int, dim: int, rng: np.random.Generator) -> np.ndarray:
-    vecs = rng.standard_normal((n, dim)).astype(np.float32)
-    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1.0, norms)
-    return (vecs / norms).astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
-# Index construction
-# ---------------------------------------------------------------------------
-
-def build_index(
-    data: np.ndarray,
-    index_type: str,
-    m: int,
-    ef_construction: int,
-    ef_search: int,
-) -> faiss.Index:
-    n, dim = data.shape
-    if index_type == "float32":
-        print(f"Building IndexHNSWFlat (float32, M={m}, ef_construction={ef_construction}) on {n:,} vectors…")
-        index = faiss.IndexHNSWFlat(dim, m, faiss.METRIC_L2)
-    else:
-        print(f"Building IndexHNSWSQ (QT_8bit, M={m}, ef_construction={ef_construction}) on {n:,} vectors…")
-        index = faiss.IndexHNSWSQ(dim, faiss.ScalarQuantizer.QT_8bit, m, faiss.METRIC_L2)
-        train_n = min(n, 50_000)
-        print(f"  Training scalar quantizer on {train_n:,} vectors…")
-        index.train(data[:train_n])
-
-    index.hnsw.efConstruction = ef_construction
-    index.hnsw.efSearch = ef_search
-
-    print(f"  Adding {n:,} vectors…")
-    batch = 100_000
-    for start in range(0, n, batch):
-        index.add(data[start: start + batch])
-        if start > 0 and start % 500_000 == 0:
-            print(f"    added {start:,} / {n:,}")
-
-    print(f"  Index built: {index.ntotal:,} vectors stored")
-    return index
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +193,13 @@ def _cache_paths(cache_dir: Path):
 
 def try_load_cache(
     cache_dir: Path,
-    n: int, dim: int, m: int, ef_construction: int, seed: int,
+    dim: int, m: int, ef_construction: int, seed: int,
     ef_search: int, index_type: str,
 ) -> Optional[tuple]:
+    """Return (index, vectors, queries, n_vectors) from cache, or None if missing/invalid.
+
+    Build the cache first with: python build_faiss_indexes.py --type {float32|int8} ...
+    """
     idx_path, vec_path, qry_path, meta_path = _cache_paths(cache_dir)
     if not all(p.exists() for p in (idx_path, vec_path, qry_path, meta_path)):
         return None
@@ -278,70 +208,25 @@ def try_load_cache(
             saved = json.load(f)
     except Exception:
         return None
-    if saved != _cache_meta(n, dim, m, ef_construction, seed, index_type):
-        print("Cache found but parameters differ — rebuilding.")
+    if (saved.get("dim") != dim or saved.get("m") != m
+            or saved.get("ef_construction") != ef_construction
+            or saved.get("seed") != seed
+            or saved.get("index_type") != index_type):
+        print(f"Cache found in '{cache_dir}' but parameters differ.")
+        print(f"  Cached:    dim={saved.get('dim')}, m={saved.get('m')}, "
+              f"ef_construction={saved.get('ef_construction')}, "
+              f"seed={saved.get('seed')}, index_type={saved.get('index_type')}")
+        print(f"  Requested: dim={dim}, m={m}, ef_construction={ef_construction}, "
+              f"seed={seed}, index_type={index_type}")
         return None
+    n_vectors = saved["n_vectors"]
     print(f"Loading cached index from: {cache_dir}")
     index = faiss.read_index(str(idx_path))
     index.hnsw.efSearch = ef_search
-    # float32 vectors mmap'd for the int8 case (not used for search, only here
-    # so the file is present; float32 case stores vectors inside the index).
     vectors = np.load(str(vec_path), mmap_mode="r")
     queries = np.load(str(qry_path))
     print(f"  Loaded {index.ntotal:,} vectors")
-    return index, vectors, queries
-
-
-def save_cache(
-    cache_dir: Path,
-    index: faiss.Index,
-    vectors: np.ndarray,
-    queries: np.ndarray,
-    n: int, dim: int, m: int, ef_construction: int, seed: int, index_type: str,
-) -> None:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    idx_path, vec_path, qry_path, meta_path = _cache_paths(cache_dir)
-    print(f"Saving index cache to: {cache_dir}")
-    faiss.write_index(index, str(idx_path))
-    np.save(str(vec_path), vectors)
-    np.save(str(qry_path), queries)
-    with meta_path.open("w") as fh:
-        json.dump(_cache_meta(n, dim, m, ef_construction, seed, index_type), fh, indent=2)
-    print(f"  Saved {index.ntotal:,} vectors")
-
-
-def try_load_shared_data(
-    shared_dir: Path, dim: int, seed: int,
-) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Load vectors.npy and queries.npy from a two-phase cache directory.
-
-    Only validates dim and seed — N is intentionally not checked because the
-    two-phase benchmark sizes N using a different memory formula, so the stored
-    N will never match what this script would compute independently.
-    After loading, the caller should derive n_vectors from vectors.shape[0].
-    """
-    vec_path = shared_dir / "vectors.npy"
-    qry_path = shared_dir / "queries.npy"
-    meta_path = shared_dir / "meta.json"
-    if not all(p.exists() for p in (vec_path, qry_path, meta_path)):
-        return None
-    try:
-        with meta_path.open() as f:
-            saved = json.load(f)
-    except Exception:
-        return None
-    if saved.get("dim") != dim or saved.get("seed") != seed:
-        print(
-            f"Shared data dir has dim={saved.get('dim')}, seed={saved.get('seed')} "
-            f"— does not match requested dim={dim}, seed={seed}. "
-            f"Ignoring --shared-data-dir."
-        )
-        return None
-    print(f"Reusing vectors and queries from shared data dir: {shared_dir}")
-    print(f"  Shared N={saved.get('n_vectors'):,} (overrides computed budget N for data reuse)")
-    vectors = np.load(str(vec_path))   # full load — we need float32 to build index
-    queries = np.load(str(qry_path))
-    return vectors, queries
+    return index, vectors, queries, n_vectors
 
 
 # ---------------------------------------------------------------------------
@@ -406,26 +291,16 @@ def main() -> None:
         "--index-type", choices=["int8", "float32"], default="float32",
         help="Index type: 'float32' (IndexHNSWFlat) or 'int8' (IndexHNSWSQ QT_8bit) (default: float32)",
     )
-    g.add_argument(
-        "--total-index-gb", type=float, default=1.0,
-        help="Memory budget for the index in GiB (default: 1.0)",
-    )
-    g.add_argument("--dim", type=int, default=128, help="Embedding dimension (default: 128)")
-    g.add_argument("--m", type=int, default=16, help="HNSW M parameter (default: 16)")
-    g.add_argument("--ef-construction", type=int, default=200, help="HNSW ef_construction (default: 200)")
-    g.add_argument("--ef-search", type=int, default=64, help="HNSW ef_search (default: 64)")
-    g.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    g.add_argument("--dim", type=int, default=None, help="Embedding dimension (resolved from cache metadata if omitted)")
+    g.add_argument("--m", type=int, default=None, help="HNSW M (resolved from cache metadata if omitted)")
+    g.add_argument("--ef-construction", type=int, default=None, help="ef_construction (resolved from cache metadata if omitted)")
+    g.add_argument("--ef-search", type=int, default=64, help="HNSW ef_search — query-time beam width (default: 64)")
+    g.add_argument("--seed", type=int, default=None, help="Random seed (resolved from cache metadata if omitted)")
     g.add_argument(
         "--index-cache-dir", default=None,
-        help="Directory to cache the built index (default: index_cache_float32 or index_cache_int8)",
+        help="Path to the pre-built index cache created by build_faiss_indexes.py "
+             "(default: index_cache_float32 or index_cache_int8)",
     )
-    g.add_argument(
-        "--shared-data-dir", default=None,
-        help="Optional path to a benchmark_faiss_twophase.py cache directory. "
-             "Reuses its vectors.npy and queries.npy so both benchmarks run on "
-             "the exact same dataset. Only the FAISS index is rebuilt.",
-    )
-    g.add_argument("--rebuild", action="store_true", help="Force index rebuild even if cache exists")
 
     # ── Query ─────────────────────────────────────────────────────────────
     g2 = parser.add_argument_group("query")
@@ -465,58 +340,47 @@ def main() -> None:
     if args.csv_out is None:
         args.csv_out = f"outputs/baseline_{args.index_type}.csv"
 
-    # ── Setup ─────────────────────────────────────────────────────────────
-    rng = np.random.default_rng(args.seed)
-    random.seed(args.seed)
-
-    # If sharing data with the two-phase cache, derive N from that dataset so
-    # the cache key is consistent across both scripts.
-    n_vectors = compute_num_vectors(args.total_index_gb, args.dim, args.m, args.index_type)
-    if args.shared_data_dir:
-        _meta_path = Path(args.shared_data_dir) / "meta.json"
+    # ── Resolve missing args from cache metadata ────────────────────────────
+    if any(v is None for v in [args.dim, args.m, args.ef_construction, args.seed]):
+        _meta_path = Path(args.index_cache_dir) / "meta.json"
         try:
             with _meta_path.open() as _f:
-                _shared_meta = json.load(_f)
-            if _shared_meta.get("dim") == args.dim and _shared_meta.get("seed") == args.seed:
-                n_vectors = _shared_meta["n_vectors"]
-        except Exception:
-            pass
+                _meta = json.load(_f)
+            for _key in ("dim", "m", "ef_construction", "seed"):
+                if _key not in _meta:
+                    raise KeyError(_key)
+        except (FileNotFoundError, json.JSONDecodeError, KeyError) as _exc:
+            raise RuntimeError(
+                f"Could not read '{_meta_path}' to resolve missing arguments.\n"
+                f"Provide --dim, --m, --ef-construction, and --seed explicitly, or "
+                f"build the cache first with:\n"
+                f"  python build_faiss_indexes.py --type {args.index_type} ..."
+            ) from _exc
+        if args.dim            is None: args.dim            = _meta["dim"]
+        if args.m              is None: args.m              = _meta["m"]
+        if args.ef_construction is None: args.ef_construction = _meta["ef_construction"]
+        if args.seed           is None: args.seed           = _meta["seed"]
 
-    print_memory_budget(n_vectors, args.dim, args.m, args.index_type)
-
+    # ── Setup ─────────────────────────────────────────────────────────────
     mem_total_bytes = get_mem_total_bytes()
     print(f"System/cgroup total RAM : {mem_total_bytes / (1024**3):.2f} GiB")
 
-    # ── Load or build index ───────────────────────────────────────────────
+    # ── Load from cache ────────────────────────────────────────────────────
     cache_dir = Path(args.index_cache_dir)
-    loaded = None if args.rebuild else try_load_cache(
-        cache_dir, n_vectors, args.dim, args.m, args.ef_construction,
+    loaded = try_load_cache(
+        cache_dir, args.dim, args.m, args.ef_construction,
         args.seed, args.ef_search, args.index_type,
     )
-
-    if loaded is not None:
-        index, vectors, query_pool = loaded
-    else:
-        # Try to reuse data (vectors + queries) from a two-phase cache
-        shared = None
-        if args.shared_data_dir:
-            shared = try_load_shared_data(
-                Path(args.shared_data_dir), args.dim, args.seed
-            )
-
-        if shared is not None:
-            vectors, query_pool = shared
-        else:
-            print(f"Generating {n_vectors:,} × dim-{args.dim} float32 vectors…")
-            vectors = generate_vectors(n_vectors, args.dim, rng)
-            print(f"Generating {args.query_pool_size} query vectors…")
-            query_pool = generate_vectors(args.query_pool_size, args.dim, rng)
-
-        index = build_index(vectors, args.index_type, args.m, args.ef_construction, args.ef_search)
-        save_cache(
-            cache_dir, index, vectors, query_pool,
-            n_vectors, args.dim, args.m, args.ef_construction, args.seed, args.index_type,
+    if loaded is None:
+        raise RuntimeError(
+            f"No valid index cache found in '{cache_dir}'.\n"
+            f"Build it first with:\n"
+            f"  python build_faiss_indexes.py --type {args.index_type} "
+            f"--total-index-gb <GB> --dim {args.dim} --m {args.m} "
+            f"--ef-construction {args.ef_construction} --seed {args.seed}"
         )
+    index, vectors, query_pool, n_vectors = loaded
+    print_memory_budget(n_vectors, args.dim, args.m, args.index_type)
 
     # ── Pressure profile ──────────────────────────────────────────────────
     if args.pressure_profile == "ramp":

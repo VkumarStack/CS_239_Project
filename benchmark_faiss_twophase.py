@@ -9,13 +9,9 @@ Architecture
   Pass 2  (adaptive): Fetch the corresponding float32 vectors and re-rank by exact L2 distance.
                       Skipped when actual memory pressure >= --rerank-threshold-pct.
 
-Memory budget
+Memory layout
 -------------
-Both indexes are sized to fit within --total-index-gb.  The same flag works on a
-laptop (e.g., 0.5) and a bare-metal server (e.g., 64).  A memory breakdown is
-printed at startup so you can verify the budget before a long run.
-
-  float32 store   : N × dim × 4 bytes
+  float32 store   : N × dim × 4 bytes   (mmap'd — only touched pages loaded)
   int8 SQ vectors : N × dim × 1 byte
   HNSW graph      : N × 2 × M × 4 bytes  (per-node neighbor lists, approximate)
   ─────────────────────────────────────────
@@ -24,25 +20,26 @@ printed at startup so you can verify the budget before a long run.
 Output CSV is compatible with plot_continuous_results.py (required columns:
 elapsed_sec, latency_ms, target_pressure_pct, actual_pressure_pct).
 
-Usage examples
---------------
-# 8 GB WSL machine — 0.5 GB index, ramp pressure (index cached after first run)
-python benchmark_faiss_twophase.py --total-index-gb 0.5 --dim 128 \\
-    --pressure-end-pct 75 --duration-seconds 120
+Usage
+-----
+Build the index first with build_faiss_indexes.py, then run this benchmark:
 
-# 128 GB bare-metal — 48 GB index, spike pressure profile
-python benchmark_faiss_twophase.py --total-index-gb 48 --dim 1536 \\
-    --pressure-profile spike --spike-peak-pct 80 --duration-seconds 300 \\
-    --csv-out outputs/twophase_spike.csv
+  # Build (once — chunked, only one chunk of RAM at a time)
+  python build_faiss_indexes.py --type twophase --total-index-gb 0.5 --dim 128
 
-# Force a full rebuild of the index cache
-python benchmark_faiss_twophase.py --total-index-gb 0.5 --dim 128 --rebuild
+  # Run with ramp pressure
+  python benchmark_faiss_twophase.py --dim 128 \\
+      --pressure-end-pct 75 --duration-seconds 120
+
+  # Run with spike pressure
+  python benchmark_faiss_twophase.py --dim 1536 \\
+      --pressure-profile spike --spike-peak-pct 80 --duration-seconds 300 \\
+      --csv-out outputs/twophase_spike.csv
 """
 import argparse
 import csv
 import json
 import multiprocessing as mp
-import random
 import statistics
 import subprocess
 import sys
@@ -165,21 +162,6 @@ def memory_pressure_worker(
 # Memory-budget sizing
 # ---------------------------------------------------------------------------
 
-def compute_num_vectors(total_gb: float, dim: int, m: int) -> int:
-    """Compute N so that both indexes together fit within *total_gb* GiB.
-
-    Memory model (approximate):
-      float32 store      = N × dim × 4  bytes
-      int8 SQ vectors    = N × dim × 1  byte
-      HNSW graph links   = N × 2 × M × 4 bytes  (int32 neighbor lists)
-      ───────────────────────────────────────────
-      total              ≈ N × (5×dim + 8×M)     bytes
-    """
-    total_bytes = total_gb * (1024 ** 3)
-    bytes_per_vector = 5 * dim + 8 * m
-    return max(1000, int(total_bytes / bytes_per_vector))
-
-
 def print_memory_budget(n: int, dim: int, m: int) -> None:
     float32_gb = n * dim * 4 / (1024 ** 3)
     int8_gb    = n * dim * 1 / (1024 ** 3)
@@ -200,56 +182,6 @@ def print_memory_budget(n: int, dim: int, m: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Data generation
-# ---------------------------------------------------------------------------
-
-def generate_vectors(n: int, dim: int, rng: np.random.Generator) -> np.ndarray:
-    """Generate L2-normalised float32 vectors (unit sphere) so cosine ≈ L2."""
-    vecs = rng.standard_normal((n, dim)).astype(np.float32)
-    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1.0, norms)
-    return (vecs / norms).astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
-# Index construction
-# ---------------------------------------------------------------------------
-
-def build_indexes(
-    data: np.ndarray,
-    m: int,
-    ef_construction: int,
-    ef_search: int,
-    metric: int = faiss.METRIC_L2,
-) -> faiss.IndexHNSWSQ:
-    """Build and return a trained FAISS IndexHNSWSQ (int8 HNSW).
-
-    The float32 data array serves as the companion rerank store; it is kept
-    in the caller's memory and NOT duplicated inside this function.
-    """
-    n, dim = data.shape
-    print(f"Building IndexHNSWSQ (QT_8bit, M={m}, ef_construction={ef_construction}) on {n:,} vectors…")
-
-    index = faiss.IndexHNSWSQ(dim, faiss.ScalarQuantizer.QT_8bit, m, metric)
-    index.hnsw.efConstruction = ef_construction
-    index.hnsw.efSearch = ef_search
-
-    train_n = min(n, 50_000)
-    print(f"  Training scalar quantizer on {train_n:,} vectors…")
-    index.train(data[:train_n])
-    print(f"  Adding {n:,} vectors…")
-
-    batch = 100_000
-    for start in range(0, n, batch):
-        index.add(data[start : start + batch])
-        if start > 0 and start % 500_000 == 0:
-            print(f"    added {start:,} / {n:,}")
-
-    print(f"  Index built: {index.ntotal:,} vectors stored")
-    return index
-
-
-# ---------------------------------------------------------------------------
 # Index persistence
 # ---------------------------------------------------------------------------
 
@@ -267,12 +199,13 @@ def _cache_paths(cache_dir: "Path"):
 
 
 def try_load_cache(
-    cache_dir: "Path", n: int, dim: int, m: int, ef_construction: int, seed: int, ef_search: int
+    cache_dir: "Path", dim: int, m: int, ef_construction: int, seed: int, ef_search: int
 ) -> Optional[tuple]:
-    """Return (int8_index, float32_store, query_pool) from cache, or None if stale/missing.
+    """Return (int8_index, float32_store, query_pool, n_vectors) from cache, or None if missing/invalid.
 
     float32_store is memory-mapped (read-only), so only touched pages are loaded
     into RAM — useful for studying OS page-eviction behaviour under pressure.
+    Build the cache first with: python build_faiss_indexes.py --type twophase ...
     """
     idx_path, vec_path, qry_path, meta_path = _cache_paths(cache_dir)
     if not all(p.exists() for p in (idx_path, vec_path, qry_path, meta_path)):
@@ -282,34 +215,22 @@ def try_load_cache(
             saved = json.load(f)
     except Exception:
         return None
-    if saved != _cache_meta(n, dim, m, ef_construction, seed):
-        print("Cache found but parameters differ — rebuilding.")
+    if (saved.get("dim") != dim or saved.get("m") != m
+            or saved.get("ef_construction") != ef_construction
+            or saved.get("seed") != seed):
+        print(f"Cache found in '{cache_dir}' but parameters differ.")
+        print(f"  Cached:    dim={saved.get('dim')}, m={saved.get('m')}, "
+              f"ef_construction={saved.get('ef_construction')}, seed={saved.get('seed')}")
+        print(f"  Requested: dim={dim}, m={m}, ef_construction={ef_construction}, seed={seed}")
         return None
+    n_vectors = saved["n_vectors"]
     print(f"Loading cached index from: {cache_dir}")
     int8_index = faiss.read_index(str(idx_path))
     int8_index.hnsw.efSearch = ef_search
     float32_store = np.load(str(vec_path), mmap_mode="r")
     query_pool = np.load(str(qry_path))
     print(f"  Loaded {int8_index.ntotal:,} vectors  (float32 store memory-mapped)")
-    return int8_index, float32_store, query_pool
-
-
-def save_cache(
-    cache_dir: "Path",
-    int8_index: faiss.IndexHNSWSQ,
-    float32_store: np.ndarray,
-    query_pool: np.ndarray,
-    n: int, dim: int, m: int, ef_construction: int, seed: int,
-) -> None:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    idx_path, vec_path, qry_path, meta_path = _cache_paths(cache_dir)
-    print(f"Saving index cache to: {cache_dir}")
-    faiss.write_index(int8_index, str(idx_path))
-    np.save(str(vec_path), float32_store)
-    np.save(str(qry_path), query_pool)
-    with meta_path.open("w") as fh:
-        json.dump(_cache_meta(n, dim, m, ef_construction, seed), fh, indent=2)
-    print(f"  Saved {int8_index.ntotal:,} vectors")
+    return int8_index, float32_store, query_pool, n_vectors
 
 
 # ---------------------------------------------------------------------------
@@ -438,28 +359,19 @@ def main() -> None:
 
     # ── Index / data ──────────────────────────────────────────────────────
     g = parser.add_argument_group("index / data")
-    g.add_argument(
-        "--total-index-gb", type=float, default=1.0,
-        help="Combined memory budget for both indexes in GiB (default: 1.0). "
-             "On 8 GB WSL try 0.5; on 128 GB bare metal try 48–96.",
-    )
-    g.add_argument("--dim", type=int, default=128,
-                   help="Embedding dimension (default: 128)")
-    g.add_argument("--m", type=int, default=16,
-                   help="HNSW M parameter — controls graph connectivity (default: 16)")
-    g.add_argument("--ef-construction", type=int, default=200,
-                   help="HNSW ef_construction — index build quality (default: 200)")
+    g.add_argument("--dim", type=int, default=None,
+                   help="Embedding dimension (resolved from cache metadata if omitted)")
+    g.add_argument("--m", type=int, default=None,
+                   help="HNSW M parameter (resolved from cache metadata if omitted)")
+    g.add_argument("--ef-construction", type=int, default=None,
+                   help="HNSW ef_construction (resolved from cache metadata if omitted)")
     g.add_argument("--ef-search", type=int, default=64,
                    help="HNSW ef_search — query-time beam width (default: 64)")
-    g.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    g.add_argument("--seed", type=int, default=None,
+                   help="Random seed (resolved from cache metadata if omitted)")
     g.add_argument(
         "--index-cache-dir", default="index_cache",
-        help="Directory to cache the built FAISS index and float32 store (default: index_cache). "
-             "Cache is reused automatically when N, dim, M, ef_construction, and seed all match.",
-    )
-    g.add_argument(
-        "--rebuild", action="store_true",
-        help="Force a full rebuild even if a valid cache exists in --index-cache-dir",
+        help="Path to the pre-built index cache created by build_faiss_indexes.py (default: index_cache)",
     )
 
     # ── Two-pass behaviour ───────────────────────────────────────────────
@@ -532,9 +444,28 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # ── Resolve missing args from cache metadata ────────────────────────────
+    if any(v is None for v in [args.dim, args.m, args.ef_construction, args.seed]):
+        _meta_path = Path(args.index_cache_dir) / "meta.json"
+        try:
+            with _meta_path.open() as _f:
+                _meta = json.load(_f)
+            for _key in ("dim", "m", "ef_construction", "seed"):
+                if _key not in _meta:
+                    raise KeyError(_key)
+        except (FileNotFoundError, json.JSONDecodeError, KeyError) as _exc:
+            raise RuntimeError(
+                f"Could not read '{_meta_path}' to resolve missing arguments.\n"
+                f"Provide --dim, --m, --ef-construction, and --seed explicitly, or "
+                f"build the cache first with:\n"
+                f"  python build_faiss_indexes.py --type twophase ..."
+            ) from _exc
+        if args.dim            is None: args.dim            = _meta["dim"]
+        if args.m              is None: args.m              = _meta["m"]
+        if args.ef_construction is None: args.ef_construction = _meta["ef_construction"]
+        if args.seed           is None: args.seed           = _meta["seed"]
+
     # ── Validation ────────────────────────────────────────────────────────
-    if args.total_index_gb <= 0:
-        raise ValueError("--total-index-gb must be > 0")
     if args.dim < 2:
         raise ValueError("--dim must be >= 2")
     if args.m < 2:
@@ -583,37 +514,24 @@ def main() -> None:
             raise ValueError("--spike-idle-seconds must be >= 0")
 
     # ── Setup ─────────────────────────────────────────────────────────────
-    rng = np.random.default_rng(args.seed)
-    random.seed(args.seed)
-
-    n_vectors = compute_num_vectors(args.total_index_gb, args.dim, args.m)
-    print_memory_budget(n_vectors, args.dim, args.m)
-
     mem_total_bytes = get_mem_total_bytes()
     print(f"System/cgroup total RAM : {mem_total_bytes / (1024**3):.2f} GiB")
 
-    # ── Generate data / load from cache ───────────────────────────────────
+    # ── Load from cache ────────────────────────────────────────────────────
     cache_dir = Path(args.index_cache_dir)
-    loaded = None if args.rebuild else try_load_cache(
-        cache_dir, n_vectors, args.dim, args.m, args.ef_construction, args.seed, args.ef_search
+    loaded = try_load_cache(
+        cache_dir, args.dim, args.m, args.ef_construction, args.seed, args.ef_search
     )
-
-    if loaded is not None:
-        int8_index, float32_store, query_pool = loaded
-    else:
-        print(f"Generating {n_vectors:,} × dim-{args.dim} float32 vectors…")
-        float32_store = generate_vectors(n_vectors, args.dim, rng)
-
-        print(f"Generating {args.query_pool_size} query vectors…")
-        query_pool = generate_vectors(args.query_pool_size, args.dim, rng)
-
-        int8_index = build_indexes(
-            float32_store, args.m, args.ef_construction, args.ef_search
+    if loaded is None:
+        raise RuntimeError(
+            f"No valid index cache found in '{cache_dir}'.\n"
+            f"Build it first with:\n"
+            f"  python build_faiss_indexes.py --type twophase "
+            f"--total-index-gb <GB> --dim {args.dim} --m {args.m} "
+            f"--ef-construction {args.ef_construction} --seed {args.seed}"
         )
-        save_cache(
-            cache_dir, int8_index, float32_store, query_pool,
-            n_vectors, args.dim, args.m, args.ef_construction, args.seed,
-        )
+    int8_index, float32_store, query_pool, n_vectors = loaded
+    print_memory_budget(n_vectors, args.dim, args.m)
 
     # ── Pressure profile ──────────────────────────────────────────────────
     if args.pressure_profile == "ramp":
