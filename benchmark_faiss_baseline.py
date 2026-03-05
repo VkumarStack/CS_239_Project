@@ -523,6 +523,7 @@ def main() -> None:
                     "--csv", str(csv_path),
                     "--out", str(png_path),
                     "--window", str(args.plot_window),
+                    "--latency-y-max", "5"
                 ],
                 check=True,
             )
