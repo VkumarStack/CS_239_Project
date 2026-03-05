@@ -401,6 +401,7 @@ def main():
         help="CSV file for per-query latency timeline",
     )
     parser.add_argument("--plot-window", type=int, default=200, help="Rolling window size for the auto-generated plot")
+    parser.add_argument("--latency-y-max", type=float, default=5, help="Y-axis max for latency in the auto-generated plot")
 
     args = parser.parse_args()
 
@@ -726,7 +727,7 @@ def main():
                     "--csv", str(csv_path),
                     "--out", str(png_path),
                     "--window", str(args.plot_window),
-                    "--latency-y-max", "15",
+                    "--latency-y-max", str(args.latency_y_max),
                 ],
                 check=True,
             )
