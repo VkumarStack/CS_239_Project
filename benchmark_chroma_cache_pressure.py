@@ -39,9 +39,12 @@ def load_collection(client: chromadb.PersistentClient, collection_name: str | No
 
 
 def fetch_random_query_embeddings(collection, query_count: int) -> List[List[float]]:
+    print(f"Fetching {query_count} random query embeddings from collection...")
     total = collection.count()
     if total == 0:
         raise RuntimeError("Collection is empty; cannot run query benchmark")
+
+    print(f"Collection has {total} vectors. Sampling random offsets...")
 
     if query_count > total:
         print(
@@ -54,7 +57,9 @@ def fetch_random_query_embeddings(collection, query_count: int) -> List[List[flo
 
     query_embeddings: List[List[float]] = []
     for offset in random_offsets:
+        print(f"Fetching embedding for random offset {offset}...")
         result = collection.get(limit=1, offset=offset, include=["embeddings"])
+        print(f"Fetched embedding for random offset {offset}")
         embeddings = result.get("embeddings")
         if embeddings is None or len(embeddings) == 0:
             raise RuntimeError(
