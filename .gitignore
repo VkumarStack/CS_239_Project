@@ -3,3 +3,4 @@ __pycache__/
 .vscode/
 index_cache/
 index_cache_float32/
+index_cache_int8/
