@@ -42,3 +42,14 @@ python benchmark_chroma_cache_continuous_adaptive.py \
   --spike-threshold-ms 150 \
   --calm-threshold-ms 50 \
   --csv-out /home/ubuntu/CS_239_Project/continuous_cache_adaptive_2.csv
+
+# runs on VM
+python3 benchmark_chroma_cache_continuous_adaptive.py \
+  --path chroma_data \
+  --duration-seconds 120 \
+  --initial-pressure-pct 0 \
+  --max-pressure-pct 95 \
+  --pressure-step-pct 5 \
+  --vm-workers 2 \
+  --eval-window-queries 200 \
+  --csv-out outputs/continuous_cache_adaptive.csv

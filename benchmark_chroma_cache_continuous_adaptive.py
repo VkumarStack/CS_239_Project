@@ -2,11 +2,10 @@
 import argparse
 import csv
 import random
-import statistics
 import time
 from collections import deque
 from pathlib import Path
-from typing import Deque, List
+from typing import Deque, List, Optional
 
 from benchmark_chroma_cache_pressure import (
     fetch_random_query_embeddings,
@@ -16,6 +15,7 @@ from benchmark_chroma_cache_pressure import (
     stop_stress_process,
     used_mem_pct,
     vmtouch_residency_pct,
+    mem_total_kb,
 )
 
 
@@ -29,12 +29,40 @@ def maybe_write_csv(path: str | None, rows: List[dict]) -> None:
         "elapsed_sec",
         "target_pressure_pct",
         "actual_pressure_pct",
+        "vmtouch_residency_pct",
         "latency_ms",
     ]
     with out_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def pctile(values: List[float], p: float) -> float:
+    if not values:
+        return float("nan")
+    xs = sorted(values)
+    if len(xs) == 1:
+        return xs[0]
+    # nearest-rank index
+    k = int(round((p / 100.0) * (len(xs) - 1)))
+    k = max(0, min(len(xs) - 1, k))
+    return xs[k]
+
+
+def start_stressor_for_target(
+    target_pct: float, total_used_pct: bool, vm_workers: int
+):
+    if target_pct <= 0:
+        return None
+
+    if total_used_pct:
+        mt_kb = mem_total_kb()
+        total_bytes = int((target_pct / 100.0) * mt_kb * 1024)
+        per_worker_bytes = max(1, total_bytes // max(1, vm_workers))
+        return start_eviction_stress_vm(None, per_worker_bytes, vm_workers)
+    else:
+        return start_eviction_stress_vm(int(target_pct), None, vm_workers)
 
 
 def main():
@@ -49,11 +77,15 @@ def main():
     parser.add_argument("--max-pressure-pct", type=float, default=95.0)
     parser.add_argument("--pressure-step-pct", type=float, default=5.0)
     parser.add_argument("--vm-workers", type=int, default=2)
-    parser.add_argument("--eval-window-queries", type=int, default=200, help="Number of most-recent queries used to compute p99")
+    parser.add_argument("--total-used-pct", action="store_true")
+    parser.add_argument("--eval-window-queries",type=int,default=200,help="Number of most-recent queries used to compute p99",)
+    parser.add_argument("--min-eval-samples",type=int,default=100,help="Minimum samples required before controller adjusts pressure (prevents noisy early oscillation)",)
     parser.add_argument("--spike-threshold-ms", type=float, default=200.0, help="If p99 >= this, reduce pressure")
     parser.add_argument("--calm-threshold-ms", type=float, default=80.0, help="If p99 <= this, increase pressure")
     parser.add_argument("--csv-out", default="outputs/continuous_cache_adaptive.csv")
     parser.add_argument("--timeline-out", default=None)
+    parser.add_argument("--ef-mode", choices=["query-argument", "collection-default"], default="collection-default", help="How to set ef_search in queries",)
+    parser.add_argument("--ef-search", type=int, default=100)
 
     args = parser.parse_args()
 
@@ -69,9 +101,7 @@ def main():
 
     # start aggressor
     current_target = float(args.initial_pressure_pct)
-    stress_proc = None
-    if current_target > 0:
-        stress_proc = start_eviction_stress_vm(int(current_target), None, args.vm_workers)
+    stress_proc = start_stressor_for_target(current_target, args.total_used_pct, args.vm_workers)
 
     start_time = time.time()
     rows: List[dict] = []
@@ -85,11 +115,21 @@ def main():
                 break
 
             emb = random.choice(query_pool)
-            lat_ms_list = run_queries(collection, [emb], top_k=10, ef_mode="query-argument" if False else "else", ef_search=100)
-            lat_ms = lat_ms_list[0]
 
-            actual_pct = used_mem_pct()
-            vt = vmtouch_residency_pct(args.path)
+            ef_mode = args.ef_mode
+            ef_search = args.ef_search if ef_mode == "query-argument" else None
+
+            lat_ms_list = run_queries(
+                collection,
+                [emb],
+                top_k=10,
+                ef_mode=ef_mode,
+                ef_search=ef_search,
+            )
+            lat_ms = float(lat_ms_list[0])
+
+            actual_pct: Optional[float] = used_mem_pct()
+            vt: Optional[float] = vmtouch_residency_pct(args.path)
 
             rows.append(
                 {
@@ -97,15 +137,17 @@ def main():
                     "elapsed_sec": round(elapsed, 6),
                     "target_pressure_pct": round(current_target, 6),
                     "actual_pressure_pct": ("" if actual_pct is None else round(actual_pct, 6)),
-                    "latency_ms": round(float(lat_ms), 6),
+                    "vmtouch_residency_pct": ("" if vt is None else round(vt, 6)),
+                    "latency_ms": round(lat_ms, 6),
                 }
             )
-            recent.append(float(lat_ms))
+            recent.append(lat_ms)
             qidx += 1
 
-            # Evaluate controller when we have enough samples
-            if len(recent) >= max(10, int(args.eval_window_queries / 4)):
-                p99 = statistics.quantiles(list(recent), n=100)[98]  # approximate 99th
+            # Evaluate controller
+            if len(recent) >= min(args.min_eval_samples, args.eval_window_queries):
+                p99 = pctile(list(recent), 99.0)
+
                 changed = False
                 if p99 >= args.spike_threshold_ms and current_target > args.min_pressure_pct:
                     # too high latency -> reduce pressure
@@ -123,10 +165,7 @@ def main():
                 if changed:
                     # restart stress-ng with new target
                     stop_stress_process(stress_proc)
-                    if current_target > 0:
-                        stress_proc = start_eviction_stress_vm(int(current_target), None, args.vm_workers)
-                    else:
-                        stress_proc = None
+                    stress_proc = start_stressor_for_target(current_target, args.total_used_pct, args.vm_workers)
 
             # sleep between queries
             if args.query_interval_ms > 0:
@@ -144,19 +183,12 @@ def main():
         # timeline schema matches plotting tool
         outp = Path(args.timeline_out)
         outp.parent.mkdir(parents=True, exist_ok=True)
-        fieldnames = ["elapsed_sec", "latency_ms", "target_pressure_pct", "actual_pressure_pct"]
+        fieldnames = ["elapsed_sec", "latency_ms", "target_pressure_pct", "actual_pressure_pct", "vmtouch_residency_pct"]
         with outp.open("w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=fieldnames)
             w.writeheader()
             for r in rows:
-                w.writerow(
-                    {
-                        "elapsed_sec": r.get("elapsed_sec", ""),
-                        "latency_ms": r.get("latency_ms", ""),
-                        "target_pressure_pct": r.get("target_pressure_pct", ""),
-                        "actual_pressure_pct": r.get("actual_pressure_pct", ""),
-                    }
-                )
+                w.writerow({k: r.get(k, "") for k in fieldnames})
         print(f"Wrote timeline CSV: {args.timeline_out}")
 
 
