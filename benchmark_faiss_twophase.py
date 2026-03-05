@@ -392,6 +392,10 @@ def main() -> None:
     g3 = parser.add_argument_group("benchmark timing")
     g3.add_argument("--duration-seconds", type=float, default=120.0,
                     help="Total benchmark runtime in seconds (default: 120)")
+    g3.add_argument(
+        "--query-source", choices=["cache", "random"], default="cache",
+        help="'cache' uses queries.npy from the index cache; 'random' generates fresh unit-sphere vectors (default: cache)",
+    )
     g3.add_argument("--query-pool-size", type=int, default=1000,
                     help="Number of pre-generated query vectors (default: 1000)")
     g3.add_argument("--query-interval-ms", type=float, default=0.0,
@@ -533,6 +537,20 @@ def main() -> None:
     int8_index, float32_store, query_pool, n_vectors = loaded
     print_memory_budget(n_vectors, args.dim, args.m)
 
+    # ── Query pool ────────────────────────────────────────────────────────
+    if args.query_source == "random":
+        rng = np.random.default_rng(args.seed if args.seed is not None else 42)
+        vecs = rng.standard_normal((args.query_pool_size, args.dim)).astype(np.float32)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        query_pool = (vecs / np.where(norms == 0, 1.0, norms)).astype(np.float32)
+        print(f"  Generated {args.query_pool_size:,} random query vectors (unit sphere)")
+    else:
+        if len(query_pool) < args.query_pool_size:
+            print(f"  Note: cache contains {len(query_pool):,} queries; "
+                  f"--query-pool-size capped to {len(query_pool):,}")
+            args.query_pool_size = len(query_pool)
+    query_pool_len = len(query_pool)
+
     # ── Pressure profile ──────────────────────────────────────────────────
     if args.pressure_profile == "ramp":
         profile_fn = make_ramp_profile(
@@ -600,7 +618,7 @@ def main() -> None:
             # Decide whether to rerank
             do_rerank = actual_pct < args.rerank_threshold_pct
 
-            query_vec = query_pool[query_index % args.query_pool_size]
+            query_vec = query_pool[query_index % query_pool_len]
 
             result_ids, total_ms, pass1_ms, pass2_ms = two_pass_query(
                 int8_index, float32_store, query_vec,

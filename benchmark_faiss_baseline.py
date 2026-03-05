@@ -306,6 +306,10 @@ def main() -> None:
     g2 = parser.add_argument_group("query")
     g2.add_argument("--top-k", type=int, default=10, help="Number of results per query (default: 10)")
     g2.add_argument("--duration-seconds", type=float, default=120.0, help="Benchmark runtime in seconds (default: 120)")
+    g2.add_argument(
+        "--query-source", choices=["cache", "random"], default="cache",
+        help="'cache' uses queries.npy from the index cache; 'random' generates fresh unit-sphere vectors (default: cache)",
+    )
     g2.add_argument("--query-pool-size", type=int, default=1000, help="Number of pre-generated queries (default: 1000)")
     g2.add_argument("--query-interval-ms", type=float, default=0.0, help="Optional sleep between queries in ms (default: 0)")
 
@@ -382,6 +386,20 @@ def main() -> None:
     index, vectors, query_pool, n_vectors = loaded
     print_memory_budget(n_vectors, args.dim, args.m, args.index_type)
 
+    # ── Query pool ────────────────────────────────────────────────────────
+    if args.query_source == "random":
+        rng = np.random.default_rng(args.seed if args.seed is not None else 42)
+        vecs = rng.standard_normal((args.query_pool_size, args.dim)).astype(np.float32)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        query_pool = (vecs / np.where(norms == 0, 1.0, norms)).astype(np.float32)
+        print(f"  Generated {args.query_pool_size:,} random query vectors (unit sphere)")
+    else:
+        if len(query_pool) < args.query_pool_size:
+            print(f"  Note: cache contains {len(query_pool):,} queries; "
+                  f"--query-pool-size capped to {len(query_pool):,}")
+            args.query_pool_size = len(query_pool)
+    query_pool_len = len(query_pool)
+
     # ── Pressure profile ──────────────────────────────────────────────────
     if args.pressure_profile == "ramp":
         profile_fn = make_ramp_profile(args.pressure_start_pct, args.pressure_end_pct, args.ramp_seconds)
@@ -436,7 +454,7 @@ def main() -> None:
                 actual_b = int(actual_bytes.value)
             actual_pct = (actual_b / mem_total_bytes) * 100.0 if mem_total_bytes else 0.0
 
-            q_buf[0] = query_pool[query_index % args.query_pool_size]
+            q_buf[0] = query_pool[query_index % query_pool_len]
 
             t0 = time.perf_counter()
             index.search(q_buf, args.top_k)
