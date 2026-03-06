@@ -388,6 +388,11 @@ def main() -> None:
         help="Skip pass-2 re-rank when actual memory pressure exceeds this %% of "
              "total RAM (default: 60.0). Set to 0 to always skip; 100 to always rerank.",
     )
+    g2.add_argument(
+        "--rerank-latency-threshold-ms", type=float, default=0.0,
+        help="Skip pass-2 re-rank when the most recent query latency exceeded this value "
+             "in ms (default: 0 = disabled). Useful for latency-based adaptive degradation.",
+    )
     # ── Benchmark timing ─────────────────────────────────────────────────
     g3 = parser.add_argument_group("benchmark timing")
     g3.add_argument("--duration-seconds", type=float, default=120.0,
@@ -587,6 +592,7 @@ def main() -> None:
     latencies: List[float] = []
     rerank_count = 0
     pass1_only_count = 0
+    last_latency_ms: float = 0.0
 
     pressure_proc.start()
     start = time.perf_counter()
@@ -595,6 +601,8 @@ def main() -> None:
 
     print(f"\nStarting benchmark  [{args.duration_seconds:.0f}s, {args.pressure_profile} profile]")
     print(f"  Rerank skipped when actual pressure >= {args.rerank_threshold_pct:.1f}%")
+    if args.rerank_latency_threshold_ms > 0:
+        print(f"  Rerank skipped when previous latency >= {args.rerank_latency_threshold_ms:.1f} ms")
     print(f"  Candidate multiplier: {args.candidate_mult}× ({args.top_k}→{args.top_k * args.candidate_mult} candidates)")
     print()
 
@@ -615,8 +623,12 @@ def main() -> None:
 
             actual_pct = (actual_b / mem_total_bytes) * 100.0 if mem_total_bytes else 0.0
 
-            # Decide whether to rerank
-            do_rerank = actual_pct < args.rerank_threshold_pct
+            # Decide whether to rerank (skip if pressure OR latency threshold exceeded)
+            latency_over = (
+                args.rerank_latency_threshold_ms > 0
+                and last_latency_ms >= args.rerank_latency_threshold_ms
+            )
+            do_rerank = actual_pct < args.rerank_threshold_pct and not latency_over
 
             query_vec = query_pool[query_index % query_pool_len]
 
@@ -625,6 +637,7 @@ def main() -> None:
                 args.top_k, args.candidate_mult, do_rerank,
             )
 
+            last_latency_ms = total_ms
             latencies.append(total_ms)
             if do_rerank:
                 rerank_count += 1
