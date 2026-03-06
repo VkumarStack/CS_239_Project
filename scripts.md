@@ -70,3 +70,14 @@ python3 benchmark_chroma_cache_continuous_adaptive.py \
   --vm-workers 2 \
   --eval-window-queries 200 \
   --csv-out outputs/continuous_cache_adaptive.csv
+
+  python benchmark_v2_chroma_cache_continuous_adaptive.py   --path chroma_data   --duration-seconds 180   --query-pool-size 500   --query-interval-ms 0   --disable-stress   --direct-cache-mode evict   --direct-cache-on-start   --direct-cache-on-change   --direct-cache-every-n-queries 50   --spike-threshold-ms 200   --calm-threshold-ms 80   --pressure-spike-threshold-pct 95   --pressure-calm-threshold-pct 75   --csv-out outputs/continuous_cache_adaptive_v2.csv   --timeline-out outputs/continuous_cache_adaptive_v2_timeline.csv
+
+  python benchmark_v2_chroma_cache_pressure.py   --path chroma_data  --mem-steps 0,0,0,0   --queries-per-step 200   --query-mode fixed   --direct-cache-mode evict   --direct-cache-before-each-step   --direct-cache-min-size-bytes 4096   --track-vmtouch   --csv-out /home/ubuntu/results_pagecache_only.csv   --timeline-out /home/ubuntu/results_pagecache_only_timeline.csv
+
+## v2 adaptive cache workload plot (latency + controller + QPS)
+python plot_continuous_cache_adaptive_v2.py \
+  --csv outputs/continuous_cache_adaptive_v2.csv \
+  --out outputs/continuous_cache_adaptive_v2.png \
+  --latency-window 150 \
+  --qps-window 120
