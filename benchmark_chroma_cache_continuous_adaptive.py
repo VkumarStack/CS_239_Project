@@ -98,6 +98,7 @@ def main():
 
     # Prepare query pool
     query_pool = fetch_random_query_embeddings(collection, args.query_pool_size)
+    print(f"Prepared query pool with {len(query_pool)} generated embeddings")
 
     # start aggressor
     current_target = float(args.initial_pressure_pct)

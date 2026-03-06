@@ -38,37 +38,26 @@ def load_collection(client: chromadb.PersistentClient, collection_name: str | No
     return client.get_collection(collections[0].name)
 
 
-def fetch_random_query_embeddings(collection, query_count: int) -> List[List[float]]:
-    print(f"Fetching {query_count} random query embeddings from collection...")
-    total = collection.count()
-    if total == 0:
-        raise RuntimeError("Collection is empty; cannot run query benchmark")
+def fetch_random_query_embeddings(collection, query_count: int, random_dim: int | None = None) -> List[List[float]]:
+    """
+    Synthesize `query_count` random query embeddings and return as a list of lists.
+    """
+    # infer embedding dim if not provided
+    if random_dim is None:
+        try:
+            result = collection.get(limit=1, offset=0, include=["embeddings"])
+            embeddings = result.get("embeddings")
+            if embeddings is None or len(embeddings) == 0:
+                raise RuntimeError("Could not infer embedding dimension from collection")
+            random_dim = len(embeddings[0])
+        except Exception as e:
+            raise RuntimeError("Failed to infer embedding dimension for random generation: " + str(e))
 
-    print(f"Collection has {total} vectors. Sampling random offsets...")
-
-    if query_count > total:
-        print(
-            f"Requested {query_count} random queries but collection has {total} vectors. "
-            f"Using {total} queries instead."
-        )
-        query_count = total
-
-    random_offsets = random.sample(range(total), k=query_count)
-
-    query_embeddings: List[List[float]] = []
-    for offset in random_offsets:
-        print(f"Fetching embedding for random offset {offset}...")
-        result = collection.get(limit=1, offset=offset, include=["embeddings"])
-        print(f"Fetched embedding for random offset {offset}")
-        embeddings = result.get("embeddings")
-        if embeddings is None or len(embeddings) == 0:
-            raise RuntimeError(
-                "Could not fetch stored embeddings from collection. "
-                "Ensure this collection contains embeddings."
-            )
-        query_embeddings.append(embeddings[0])
-
-    return query_embeddings
+    print(f"Generating {query_count} random embeddings (dim={int(random_dim)})")
+    rng = np.random.default_rng()
+    arr = rng.random((query_count, int(random_dim)), dtype=np.float32)
+    print(f"Generated {query_count} random embeddings with dim={int(random_dim)}")
+    return arr.tolist()
 
 
 def apply_ef_search(collection, ef_search: int) -> str:
@@ -394,7 +383,7 @@ def main():
     presampled_query_sets: List[List[List[float]]] = []
 
     if args.query_mode == "fixed":
-        print("Preparing one fixed random query set from existing vectors...")
+        print("Preparing one fixed random query set (generated) ...")
         fixed_query_embeddings = fetch_random_query_embeddings(collection, args.queries_per_step)
     elif args.query_mode == "presampled":
         print("Pre-sampling random query sets for all steps...")
