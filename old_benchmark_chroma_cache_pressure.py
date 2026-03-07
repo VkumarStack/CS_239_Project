@@ -6,6 +6,8 @@ import random
 import shutil
 import statistics
 import subprocess
+import sys
+import re
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -111,30 +113,41 @@ def warm_cache_with_vmtouch(data_path: str) -> None:
         raise RuntimeError(f"vmtouch failed with exit code {r.returncode}")
 
 
-def vmtouch_residency_pct(data_path: str) -> Optional[float]:
+def vmtouch_residency_pct(data_path: str, timeout: float = 2.0) -> Optional[float]:
     """
     Returns % pages resident according to vmtouch, or None if vmtouch missing/fails.
+
+    Adds an optional `timeout` (seconds) so callers can avoid long blocking vmtouch runs.
+    On failure, logs a short diagnostic to stderr to aid debugging.
     """
     if shutil.which("vmtouch") is None:
+        print("vmtouch_residency_pct: vmtouch binary not found", file=sys.stderr)
         return None
     try:
-        # vmtouch -v prints a summary including "Resident Pages"
-        r = subprocess.run(["vmtouch", "-v", data_path], capture_output=True, text=True, check=False)
-        if r.returncode != 0:
-            return None
-        out = r.stdout.splitlines()
-        # heuristic parse: look for a line like "Resident Pages: 1234/5678  (21.7%)"
-        for line in out:
-            if "Resident Pages" in line and "%" in line:
-                # extract the "(xx.x%)"
-                l = line.strip()
-                lp = l.rfind("(")
-                rp = l.rfind("%")
-                if lp != -1 and rp != -1 and rp > lp:
-                    pct_str = l[lp + 1 : rp].strip()
-                    return float(pct_str)
-    except Exception:
+        r = subprocess.run(["vmtouch", "-v", data_path], capture_output=True, text=True, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"vmtouch_residency_pct: vmtouch timed out after {timeout}s", file=sys.stderr)
         return None
+    except Exception as e:
+        print(f"vmtouch_residency_pct: vmtouch subprocess failed: {e}", file=sys.stderr)
+        return None
+
+    if r.returncode != 0:
+        print(f"vmtouch_residency_pct: vmtouch returned rc={r.returncode} stderr={r.stderr}", file=sys.stderr)
+        return None
+
+    # Try a robust regex search for a numeric percent (handles both "(1.25%)" and "1.25%" forms)
+    combined = (r.stdout or "") + "\n" + (r.stderr or "")
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)%", combined)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            print(f"vmtouch_residency_pct: regex parse error for '{m.group(1)}'", file=sys.stderr)
+            return None
+
+    # nothing matched
+    print(f"vmtouch_residency_pct: parse failed, output:\n{combined}", file=sys.stderr)
     return None
 
 def read_meminfo_kb() -> dict:

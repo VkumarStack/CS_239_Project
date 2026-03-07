@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import inspect
 import random
 import time
 from collections import deque
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Deque, List, Optional
 
 from benchmark_v2_chroma_cache_pressure import (
+    apply_ef_search,
     fetch_random_query_embeddings,
     load_collection,
     maybe_direct_cache_transition,
@@ -16,6 +18,7 @@ from benchmark_v2_chroma_cache_pressure import (
     stop_stress_process,
     used_mem_pct,
     vmtouch_residency_pct,
+    warm_cache_with_vmtouch,
     mem_total_kb,
 )
 
@@ -99,6 +102,8 @@ def main():
     parser.add_argument("--sample-used-mem-every-n-queries", type=int, default=1, help="Sample used memory every N queries.")
     parser.add_argument("--track-vmtouch", action="store_true", help="Enable vmtouch residency sampling (expensive).")
     parser.add_argument("--sample-vmtouch-every-n-queries", type=int, default=50, help="If --track-vmtouch, sample vmtouch every N queries.")
+    parser.add_argument("--vmtouch-timeout-seconds", type=float, default=2.0, help="Timeout for each vmtouch residency sample.")
+    parser.add_argument("--preload-cache", action="store_true", help="Warm cache with vmtouch before benchmark loop.")
     parser.add_argument(
         "--direct-cache-mode",
         choices=["none", "evict", "willneed", "readwarm"],
@@ -142,6 +147,19 @@ def main():
     collection = load_collection(client, args.collection)
     print(f"Using collection: {collection.name} ({collection.count()} vectors)")
 
+    resolved_ef_mode = args.ef_mode
+    if args.ef_mode == "collection-default":
+        resolved_ef_mode = apply_ef_search(collection, args.ef_search)
+    elif args.ef_mode == "query-argument":
+        query_signature = inspect.signature(collection.query)
+        if "search_ef" not in query_signature.parameters:
+            print(
+                "Requested --ef-mode=query-argument, but this Chroma build does not "
+                "support query(search_ef=...). Falling back to collection-default mode."
+            )
+            resolved_ef_mode = apply_ef_search(collection, args.ef_search)
+    print(f"ef_search mode: {resolved_ef_mode} (requested={args.ef_mode}, ef_search={args.ef_search})")
+
     # Prepare query pool
     query_pool = fetch_random_query_embeddings(collection, args.query_pool_size)
     print(f"Prepared query pool with {len(query_pool)} generated embeddings")
@@ -151,6 +169,9 @@ def main():
     stress_proc = None
     if not args.disable_stress:
         stress_proc = start_stressor_for_target(current_target, args.total_used_pct, args.vm_workers)
+
+    if args.preload_cache:
+        warm_cache_with_vmtouch(args.path)
 
     if args.direct_cache_on_start and args.direct_cache_mode != "none":
         maybe_direct_cache_transition(
@@ -196,7 +217,7 @@ def main():
                 )
                 pre_query_action = f"periodic:{args.direct_cache_mode}"
 
-            ef_mode = args.ef_mode
+            ef_mode = resolved_ef_mode
             ef_search = args.ef_search if ef_mode == "query-argument" else None
 
             lat_ms_list = run_queries(
@@ -216,7 +237,7 @@ def main():
                 and args.sample_vmtouch_every_n_queries > 0
                 and (qidx % args.sample_vmtouch_every_n_queries == 0)
             ):
-                last_vt = vmtouch_residency_pct(args.path)
+                last_vt = vmtouch_residency_pct(args.path, timeout=args.vmtouch_timeout_seconds)
 
             actual_pct = last_actual_pct
             vt = last_vt
