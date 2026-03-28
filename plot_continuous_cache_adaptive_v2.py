@@ -17,13 +17,29 @@ def rolling_percentile(values: np.ndarray, window: int, pct: float) -> np.ndarra
     return out
 
 
-def rolling_qps(elapsed_sec: np.ndarray, window: int) -> np.ndarray:
-    if window < 2:
-        window = 2
-    out = np.full(elapsed_sec.shape, np.nan, dtype=float)
-    for i in range(window - 1, len(elapsed_sec)):
-        dt = elapsed_sec[i] - elapsed_sec[i - window + 1]
-        out[i] = (window - 1) / dt if dt > 0 else np.nan
+def binned_qps(elapsed_sec: np.ndarray, bin_seconds: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
+    if elapsed_sec.size == 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+    if bin_seconds <= 0:
+        raise ValueError("bin_seconds must be > 0")
+
+    end_t = float(np.nanmax(elapsed_sec))
+    edges = np.arange(0.0, end_t + bin_seconds, bin_seconds, dtype=float)
+    if edges.size < 2:
+        edges = np.array([0.0, bin_seconds], dtype=float)
+    counts, _ = np.histogram(elapsed_sec, bins=edges)
+    qps = counts.astype(float) / bin_seconds
+    times = edges[:-1]
+    return times, qps
+
+
+def trailing_rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
+    if window < 1:
+        window = 1
+    out = np.full(values.shape, np.nan, dtype=float)
+    for i in range(values.size):
+        start = max(0, i - window + 1)
+        out[i] = float(np.mean(values[start : i + 1]))
     return out
 
 
@@ -118,7 +134,8 @@ def make_plot(
     lat_p50 = rolling_percentile(latency, latency_window, 50.0)
     lat_p95 = rolling_percentile(latency, latency_window, 95.0)
     lat_p99 = rolling_percentile(latency, latency_window, 99.0)
-    qps = rolling_qps(elapsed, qps_window)
+    qps_t, qps_raw = binned_qps(elapsed, bin_seconds=1.0)
+    qps = trailing_rolling_mean(qps_raw, qps_window)
 
     fig, axes = plt.subplots(3, 1, figsize=(13, 11), sharex=True)
     ax_lat, ax_press, ax_qps = axes
@@ -167,10 +184,10 @@ def make_plot(
     ax_press.grid(alpha=0.25)
     ax_press.legend(loc="upper left", fontsize=9)
 
-    ax_qps.plot(elapsed, qps, linewidth=2.0, color="tab:green", label=f"Rolling QPS ({qps_window})")
+    ax_qps.plot(qps_t, qps, linewidth=2.0, color="tab:green", label=f"QPS (1s bins, rolling {qps_window})")
     ax_qps.set_xlabel("Elapsed time (s)")
     ax_qps.set_ylabel("Queries/sec")
-    ax_qps.set_title("Throughput Over Time")
+    ax_qps.set_title("Throughput (Rolling Average)")
     ax_qps.grid(alpha=0.25)
     ax_qps.legend(loc="upper left", fontsize=9)
 
